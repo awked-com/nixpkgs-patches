@@ -1,8 +1,9 @@
 # Nixpkgs patches
 
 Reusable fixes and opt-in integrations layered over Nixpkgs packages. This
-repository contains patches, thin package wrappers, and an overlay. It does not
-contain system configurations or require another repository maintained by Awked.
+repository contains patches, thin package wrappers, and an overlay. Package
+overrides use Nixpkgs; the development shell also uses the shared
+`awked-com/packages` input for the standalone patch maintenance command.
 
 ## Use
 
