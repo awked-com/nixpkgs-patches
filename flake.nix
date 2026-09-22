@@ -19,6 +19,7 @@
         };
     in
     {
+      lib.patchFiles = import ./pkgs/lib/patches.nix;
       overlays.default = import ./overlay.nix;
       packages = forAllSystems (
         system:

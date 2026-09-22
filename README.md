@@ -88,3 +88,7 @@ Keep patches in filename order as `NNNN-description.patch`. Use Quilt against an
 unpatched copy of the locked upstream source, refresh without timestamps, and
 retain existing authorship and copyright notices. See [PROVENANCE.md](PROVENANCE.md)
 for source and licensing boundaries.
+
+`lib.patchFiles lib directory` returns a directory's numbered patch files in
+filename order and rejects invalid patch names. Consumers can reuse it for
+additional package overrides.
