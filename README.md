@@ -89,6 +89,22 @@ unpatched copy of the locked upstream source, refresh without timestamps, and
 retain existing authorship and copyright notices. See [PROVENANCE.md](PROVENANCE.md)
 for source and licensing boundaries.
 
+The standalone `overlay` command can manage these stacks using this flake's
+locked sources. With it installed, run from this checkout:
+
+```sh
+overlay list
+overlay setup dnsmasq
+overlay status dnsmasq
+overlay select dnsmasq 0001-renew-nftset-element-timeouts.patch
+overlay edit dnsmasq src/nftset.c
+overlay refresh dnsmasq
+```
+
+Use `overlay -C /path/to/nixpkgs-patches` from another directory. Source worktrees
+live under `.patch-worktrees/pkgs`; keep them out of version control. The tool
+refreshes patch files; the Nix overlay still attaches them to each package.
+
 `lib.patchFiles lib directory` returns a directory's numbered patch files in
 filename order and rejects invalid patch names. Consumers can reuse it for
 additional package overrides.
