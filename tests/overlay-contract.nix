@@ -1,16 +1,10 @@
 {
   lib,
+  packages,
   pkgs,
   upstream,
 }:
 let
-  overlay = import ../overlay.nix;
-  allPackages = overlay pkgs upstream;
-  supported = lib.filterAttrs (
-    name: package:
-    lib.meta.availableOn pkgs.stdenv.hostPlatform package
-    && (name != "btrbk" || pkgs.stdenv.hostPlatform.isLinux)
-  ) allPackages;
   reference =
     name:
     if name == "nextcloud-oidc-login" then
@@ -48,7 +42,7 @@ let
     settings package == settings original
     && localPatches != [ ]
     && package.patches == (original.patches or [ ]) ++ localPatches
-  ) supported;
+  ) packages;
   headlessOptions = {
     guiSupport = false;
     webuiSupport = false;
@@ -57,7 +51,7 @@ let
   headless = pkgs.qbittorrent.override headlessOptions;
   upstreamHeadless = upstream.qbittorrent.override headlessOptions;
   overrides =
-    lib.optionalAttrs (builtins.hasAttr "qbittorrent" supported) {
+    lib.optionalAttrs (builtins.hasAttr "qbittorrent" packages) {
       qbittorrent-options =
         headless.pname == upstreamHeadless.pname
         && headless.cmakeFlags == upstreamHeadless.cmakeFlags
@@ -84,7 +78,7 @@ let
               "sonarr"
               "radarr"
             ]
-          ) supported
+          ) packages
         );
   failures = builtins.attrNames (lib.filterAttrs (_: passes: !passes) (contracts // overrides));
 in

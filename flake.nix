@@ -39,7 +39,7 @@
           lib.meta.availableOn pkgs.stdenv.hostPlatform package
           # The locked btrbk recipe permits Unix but needs Linux-only btrfs-progs.
           && (name != "btrbk" || pkgs.stdenv.hostPlatform.isLinux)
-        ) (self.overlays.default pkgs pkgs)
+        ) (lib.getAttrs (builtins.attrNames (self.overlays.default pkgs pkgs)) pkgs)
       );
       checks = forAllSystems (
         system:
@@ -47,6 +47,7 @@
         // {
           overlay-contract = import ./tests/overlay-contract.nix {
             inherit lib;
+            packages = self.packages.${system};
             pkgs = pkgsFor system;
             upstream = import nixpkgs { inherit system; };
           };
