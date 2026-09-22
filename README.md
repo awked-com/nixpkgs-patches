@@ -1,9 +1,7 @@
 # Nixpkgs patches
 
-Reusable fixes and opt-in integrations layered over Nixpkgs packages. This
-repository contains patches, thin package wrappers, and an overlay. Package
-overrides use Nixpkgs; the development shell also uses the shared
-`awked-com/packages` input for the standalone patch maintenance command.
+Patches and package wrappers for Nixpkgs, exposed through `overlays.default`
+and per-system `packages` outputs.
 
 ## Use
 
@@ -25,12 +23,11 @@ Or build a package directly:
 nix build github:awked-com/nixpkgs-patches#dnsmasq
 ```
 
-The lockfile identifies the tested Nixpkgs source. Following a different Nixpkgs
-revision may require refreshing patches. Wrappers preserve upstream `.override`
-arguments, existing patches, dependencies, and build options, with the explicit
-exceptions documented below. Outputs cover x86_64 Linux, aarch64 Linux, and
-aarch64 macOS, filtered by each upstream package's platform support. Btrbk is
-exposed only on Linux because its `btrfs-progs` dependency requires Linux.
+The lockfile pins Nixpkgs; other revisions may require refreshing patches.
+Wrappers preserve upstream `.override` arguments, patches, dependencies, and
+build options except as listed below. Outputs cover `x86_64-linux`,
+`aarch64-linux`, and `aarch64-darwin`, filtered by upstream platform support.
+Btrbk is Linux-only because it needs `btrfs-progs`.
 
 ## Packages
 
@@ -51,10 +48,9 @@ exposed only on Linux because its `btrfs-progs` dependency requires Linux.
 | sonarr | Honor literal IP address families and trust forwarded headers only from `SONARR_TRUSTED_PROXY`. |
 | uxplay | Optional display ownership hooks, enforcement of disabled HLS, bounded control requests, and validation of PIN pairing. |
 
-The Sonarr and Prowlarr proxy variables each accept one literal IPv4 or IPv6
-address. When absent or invalid, forwarded headers are disabled. Only one proxy
-hop is trusted. The overlay changes that default, so set the appropriate variable
-when using a reverse proxy.
+`SONARR_TRUSTED_PROXY` and `PROWLARR_TRUSTED_PROXY` each accept one literal IPv4
+or IPv6 address and trust one proxy hop. Forwarded headers are disabled when the
+variable is absent or invalid; set it when using a reverse proxy.
 
 UxPlay's optional `UXPLAY_DISPLAY_COMMAND` names an executable called with
 `acquire uxplay` and `release uxplay`; it runs without a shell. Keep HLS disabled
@@ -63,36 +59,31 @@ queued nonblocking FCUP output, which these patches do not provide. Miraclecast
 exposes `MIRACLECAST_WPA_CONTROL`, `MIRACLECAST_WPA_CLIENT_DIR`, and
 `MIRACLECAST_SOCKET_MARK` for integrations; no host-specific values are supplied.
 
-The Miraclecast wrapper disables reliance on udev tags and adds the GStreamer
-base plugin dependency. The Nextcloud app wrapper removes the original app
-signature because patching changes its contents. Exportarr allows local
-networking during macOS builds. The Sonarr, Radarr, and Prowlarr wrappers retain
-`doCheck = false`; their upstream test suites are not run by those derivations.
+Miraclecast disables reliance on udev tags and adds GStreamer's base plugin.
+`nextcloud-oidc-login` wraps `nextcloud34.packages.apps.oidc_login` and removes
+the app signature invalidated by patching. Exportarr allows local networking
+during macOS builds. Sonarr, Radarr, and Prowlarr retain `doCheck = false`.
 
 ## Develop and check
 
 ```sh
-nix develop
+git ls-files -z '*.nix' | xargs -0 nix fmt -- --check
 nix flake check --no-build --all-systems
 nix build .#checks.aarch64-darwin.overlay-contract
 nix flake check
 ```
 
-Use the matching system name for the contract build. Evaluation checks compare
-inherited build settings, ensure local patches are attached after upstream
-patches, and exercise preserved package override arguments. Full flake checks
-build supported packages on the current system; they do not establish runtime
-correctness on all platforms. Network, display, mount, and authentication changes
-also need upstream and integration testing appropriate to their behavior.
+Use the matching system name for the contract build. It checks exported package
+settings, patch order, and upstream override arguments. Full flake checks build
+supported packages on the current system. Network, display, mount, and
+authentication changes also need runtime integration tests.
 
 Keep patches in filename order as `NNNN-description.patch`. Use Quilt against an
-unpatched copy of the locked upstream source, refresh without timestamps, and
-retain existing authorship and copyright notices. See [PROVENANCE.md](PROVENANCE.md)
-for source and licensing boundaries.
+unpatched copy of the locked upstream source and refresh without timestamps.
 
-The standalone [overlay](https://github.com/awked-com/overlay) command manages
-these stacks using this flake's locked sources. `nix develop` provides its
-pinned package. From this checkout:
+The [overlay](https://github.com/awked-com/overlay) command uses this flake's
+locked sources. `nix develop` provides it through the pinned
+`awked-com/packages` input:
 
 ```sh
 nix develop
@@ -105,9 +96,14 @@ overlay refresh dnsmasq
 ```
 
 Use `overlay -C /path/to/nixpkgs-patches` from another directory. Source worktrees
-live under `.patch-worktrees/pkgs`; keep them out of version control. The tool
-refreshes patch files; the Nix overlay still attaches them to each package.
+live under `.patch-worktrees/pkgs` and are ignored by Git.
 
 `lib.patchFiles lib directory` returns a directory's numbered patch files in
 filename order and rejects invalid patch names. Consumers can reuse it for
 additional package overrides.
+
+Retain patch authorship, commit references, and copyright notices. AmneziaWG
+patches 0001–0004 retain their WireGuard authors; 0005 names Rany Hany; 0006 has
+no author header. Other patches are generally plain diffs without complete
+author or license declarations. This repository has no repository-wide license;
+upstream source and license metadata remain in the Nixpkgs recipes.
