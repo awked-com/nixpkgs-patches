@@ -1,0 +1,34 @@
+--- qbittorrent.orig/src/webui/webapplication.cpp
++++ qbittorrent/src/webui/webapplication.cpp
+@@ -800,9 +800,9 @@
+ 
+ bool WebApplication::isAuthNeeded()
+ {
+-    if (!m_isLocalAuthEnabled && m_clientAddress.isLoopback())
++    if (!m_isLocalAuthEnabled && m_env.clientAddress.isLoopback())
+         return false;
+-    if (m_isAuthSubnetWhitelistEnabled && Utils::Net::isIPInSubnets(m_clientAddress, m_authSubnetWhitelist))
++    if (m_isAuthSubnetWhitelistEnabled && Utils::Net::isIPInSubnets(m_env.clientAddress, m_authSubnetWhitelist))
+         return false;
+     return true;
+ }
+@@ -873,7 +873,8 @@
+ {
+     // https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy
+ 
+-    if (m_isReverseProxySupportEnabled)
++    if (m_isReverseProxySupportEnabled
++        && Utils::Net::isIPInSubnets(m_env.clientAddress, m_trustedReverseProxyList))
+     {
+         const QString forwardedProto = request().headers.value(Http::HEADER_X_FORWARDED_PROTO);
+         if (forwardedProto.compare(u"https", Qt::CaseInsensitive) == 0)
+@@ -898,7 +899,8 @@
+                 && (left.host() == right.host()));
+     };
+ 
+-    const QString targetOrigin = m_isReverseProxySupportEnabled
++    const QString targetOrigin = (m_isReverseProxySupportEnabled
++        && Utils::Net::isIPInSubnets(m_env.clientAddress, m_trustedReverseProxyList))
+         ? request.headers.value(Http::HEADER_X_FORWARDED_HOST, request.headers.value(Http::HEADER_HOST))
+         : request.headers.value(Http::HEADER_HOST);
+     const QString originValue = request.headers.value(Http::HEADER_ORIGIN);

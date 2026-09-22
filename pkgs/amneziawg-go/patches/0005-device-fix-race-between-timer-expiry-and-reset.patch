@@ -1,0 +1,64 @@
+From 09443616e4346d6da24ced6032dc27e3aa525806 Mon Sep 17 00:00:00 2001
+From: Rany Hany <rany_hany@riseup.net>
+Date: Mon, 7 Sep 2026 00:19:50 +0000
+Subject: [PATCH] device: fix race between timer expiry and reset
+
+Restore upstream WireGuard's pending flag and clear it under the lock
+so timer expiry cannot overwrite a concurrent reset.
+
+Signed-off-by: Rany Hany <rany_hany@riseup.net>
+---
+ device/timers.go | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+--- amneziawg-go.orig/device/timers.go
++++ amneziawg-go/device/timers.go
+@@ -23,6 +23,7 @@
+ 	modifyingLock sync.RWMutex
+ 	runningLock   sync.Mutex
+ 	duration      time.Duration
++	isPending     bool
+ }
+ 
+ func (peer *Peer) NewTimer(expirationFunction func(*Peer, time.Duration)) *Timer {
+@@ -32,13 +33,13 @@
+ 		defer timer.runningLock.Unlock()
+ 
+ 		timer.modifyingLock.Lock()
+-		if timer.duration == 0 {
++		if !timer.isPending {
+ 			timer.modifyingLock.Unlock()
+ 			return
+ 		}
+ 		duration := timer.duration
++		timer.isPending = false
+ 		timer.modifyingLock.Unlock()
+-		timer.duration = 0
+ 
+ 		expirationFunction(peer, duration)
+ 	})
+@@ -49,13 +50,14 @@
+ func (timer *Timer) Mod(d time.Duration) {
+ 	timer.modifyingLock.Lock()
+ 	timer.duration = d
++	timer.isPending = true
+ 	timer.Reset(d)
+ 	timer.modifyingLock.Unlock()
+ }
+ 
+ func (timer *Timer) Del() {
+ 	timer.modifyingLock.Lock()
+-	timer.duration = 0
++	timer.isPending = false
+ 	timer.Stop()
+ 	timer.modifyingLock.Unlock()
+ }
+@@ -70,7 +72,7 @@
+ func (timer *Timer) IsPending() bool {
+ 	timer.modifyingLock.RLock()
+ 	defer timer.modifyingLock.RUnlock()
+-	return timer.duration > 0
++	return timer.isPending
+ }
+ 
+ func (peer *Peer) timersActive() bool {

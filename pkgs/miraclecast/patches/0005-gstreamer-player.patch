@@ -1,0 +1,776 @@
+--- miraclecast.orig/src/ctl/meson.build
++++ miraclecast/src/ctl/meson.build
+@@ -11,14 +11,17 @@
+   dependencies: deps
+ )
+ 
++gstreamer = dependency('gstreamer-1.0')
++
+ miracle_sinkctl_srcs = ['ctl-cli.c',
+   'ctl-sink.c',
+   'ctl-wifi.c',
++  'sink-player.c',
+   'sinkctl.c',
+   'wfd.c'
+ ]
+ executable('miracle-sinkctl', miracle_sinkctl_srcs,
+   install: true,
+   include_directories: inc,
+-  dependencies: deps
++  dependencies: deps + [gstreamer]
+ )
+--- /dev/null
++++ miraclecast/src/ctl/sink-player.c
+@@ -0,0 +1,714 @@
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <gst/gst.h>
++
++#include "sink-player.h"
++
++#define DEFAULT_PORT 7236
++#define KEYFRAME_INTERVAL_MS 1000
++#define JITTER_LATENCY_MS 80
++
++typedef enum {
++    STREAM_VIDEO,
++    STREAM_AUDIO,
++} StreamKind;
++
++typedef struct Player Player;
++
++typedef struct {
++    StreamKind kind;
++    const gchar *name;
++    GstElement *bin;
++    GstPad *sinkpad;		/* ghost pad ref, owned */
++    GstPad *srcpad;		/* demux source pad ref, owned */
++    guint links;
++} Branch;
++
++typedef struct {
++    gchar *bind_address;
++    gint port;
++    gchar *video_decoder;
++    gchar *video_caps;
++    gchar *video_sink;
++    gchar *audio_sink;
++} Options;
++
++struct Player {
++    GThread *thread;
++    GMainContext *context;
++    GMainLoop *loop;
++    int notify_rfd;
++    int notify_wfd;
++    Options options;
++
++    GstElement *pipeline;
++    GstElement *jitter;
++    GstElement *demux;
++    GstBus *bus;
++    guint bus_watch;
++    Branch video;
++    Branch audio;
++
++    guint keyframe_source;
++    gint video_ready;
++    gint video_dropping;
++    gint reset_video;
++    gint paused;
++};
++
++static Player player;
++
++static void
++notify(char event)
++{
++    ssize_t r;
++
++    do {
++        r = write(player.notify_wfd, &event, 1);
++    } while (r < 0 && errno == EINTR);
++}
++
++/* Streaming threads set flags; only the main context requests keyframes. */
++static gboolean
++request_keyframe(gpointer user_data)
++{
++    Player *p = user_data;
++
++    if (!g_atomic_int_get(&p->paused) &&
++        (!g_atomic_int_get(&p->video_ready) ||
++         g_atomic_int_get(&p->video_dropping) ||
++         g_atomic_int_get(&p->reset_video)))
++        notify(SINK_PLAYER_EVENT_IDR);
++    return G_SOURCE_CONTINUE;
++}
++
++static void
++print_error(GstMessage *message)
++{
++    GError *error = NULL;
++    gchar *debug = NULL;
++
++    gst_message_parse_error(message, &error, &debug);
++    g_printerr("%s: %s\n", GST_OBJECT_NAME(GST_MESSAGE_SRC(message)),
++               error != NULL ? error->message : "unknown GStreamer error");
++    if (debug != NULL && *debug != '\0')
++        g_printerr("%s\n", debug);
++    g_clear_error(&error);
++    g_free(debug);
++}
++
++static gboolean
++bus_message(GstBus *bus, GstMessage *message, gpointer user_data)
++{
++    Player *p = user_data;
++
++    switch (GST_MESSAGE_TYPE(message)) {
++    case GST_MESSAGE_ERROR:
++        print_error(message);
++        gst_bus_set_flushing(bus, TRUE);
++        g_main_loop_quit(p->loop);
++        break;
++    case GST_MESSAGE_LATENCY:
++        gst_bin_recalculate_latency(GST_BIN(p->pipeline));
++        break;
++    case GST_MESSAGE_EOS:
++        /* UDP EOS can mean replaced streams; the controller decides session end. */
++        g_print("pipeline signalled end of stream\n");
++        break;
++    default:
++        break;
++    }
++    return G_SOURCE_CONTINUE;
++}
++
++static GstPadProbeReturn
++drop_corrupt_video(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
++{
++    Player *p = user_data;
++    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
++    gboolean corrupt = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_CORRUPTED);
++    gboolean keyframe = !GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
++
++    (void)pad;
++    if (g_atomic_int_compare_and_exchange(&p->reset_video, TRUE, FALSE) ||
++        GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DISCONT) || corrupt)
++        g_atomic_int_set(&p->video_dropping, TRUE);
++
++    if (g_atomic_int_get(&p->video_dropping)) {
++        if (corrupt || !keyframe || !gst_buffer_get_size(buffer))
++            return GST_PAD_PROBE_DROP;
++        g_atomic_int_set(&p->video_dropping, FALSE);
++    }
++    return GST_PAD_PROBE_OK;
++}
++
++/* Parsed keyframes can still fail to decode; readiness requires decoded video. */
++static GstPadProbeReturn
++video_ready(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
++{
++    Player *p = user_data;
++    GstBuffer *buffer;
++
++    (void)pad;
++
++    buffer = GST_PAD_PROBE_INFO_BUFFER(info);
++    if (!gst_buffer_get_size(buffer) ||
++        GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_CORRUPTED) ||
++        GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DECODE_ONLY) ||
++        GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_GAP))
++        return GST_PAD_PROBE_OK;
++
++    g_atomic_int_set(&p->video_ready, TRUE);
++    notify(SINK_PLAYER_EVENT_READY);
++    return GST_PAD_PROBE_REMOVE;
++}
++
++static gchar *
++branch_launch(const Player *p, StreamKind kind)
++{
++    const Options *options = &p->options;
++
++    if (kind == STREAM_VIDEO) {
++        return g_strdup_printf(
++            "queue name=video_input max-size-buffers=512 "
++            "max-size-bytes=16777216 max-size-time=2000000000 ! "
++            "h264parse name=video_parser config-interval=-1 ! "
++            "video/x-h264,alignment=au ! "
++            "%s ! %s ! videoscale ! "
++            "queue name=video_display_queue max-size-buffers=4 "
++            "max-size-bytes=0 max-size-time=0 ! "
++            "%s name=video_sink",
++            options->video_decoder,
++            options->video_caps,
++            options->video_sink);
++    } else {
++        /* Sources may send MPEG-1/2 audio despite advertising AAC. */
++        return g_strdup_printf(
++            "queue name=audio_input max-size-buffers=512 "
++            "max-size-bytes=16777216 max-size-time=2000000000 ! "
++            "decodebin ! audioconvert ! audioresample ! "
++            "audio/x-raw,layout=interleaved ! "
++            "%s name=audio_sink",
++            options->audio_sink);
++    }
++}
++
++static gboolean
++branch_create(Player *p, Branch *branch, StreamKind kind)
++{
++    GError *error = NULL;
++    gchar *launch = branch_launch(p, kind);
++    GstElement *input;
++    GstPad *input_pad, *ghost;
++
++    branch->kind = kind;
++    branch->name = kind == STREAM_VIDEO ? "video" : "audio";
++    branch->bin = gst_parse_bin_from_description(launch, FALSE, &error);
++    if (error != NULL) {
++        /* Parse errors can return a bin with missing links. */
++        g_clear_object(&branch->bin);
++    }
++    if (branch->bin == NULL) {
++        g_printerr("Could not create %s branch: %s\n%s\n",
++                   branch->name,
++                   error != NULL ? error->message : "unknown error",
++                   launch);
++        g_clear_error(&error);
++        g_free(launch);
++        return FALSE;
++    }
++    g_free(launch);
++
++    /* Automatic ghosting can expose audioconvert before decodebin links our queue. */
++    input = gst_bin_get_by_name(GST_BIN(branch->bin),
++                               kind == STREAM_VIDEO ? "video_input"
++                                                    : "audio_input");
++    input_pad = input != NULL ? gst_element_get_static_pad(input, "sink")
++                              : NULL;
++    if (input != NULL)
++        gst_object_unref(input);
++    if (input_pad == NULL) {
++        g_printerr("%s branch has no input queue sink pad\n", branch->name);
++        g_clear_object(&branch->bin);
++        return FALSE;
++    }
++    ghost = gst_ghost_pad_new("sink", input_pad);
++    gst_object_unref(input_pad);
++    if (ghost == NULL || !gst_element_add_pad(branch->bin, ghost)) {
++        if (ghost != NULL)
++            gst_object_unref(ghost);
++        g_clear_object(&branch->bin);
++        return FALSE;
++    }
++
++    gst_element_set_name(branch->bin,
++                         kind == STREAM_VIDEO ? "video_branch"
++                                              : "audio_branch");
++    if (!gst_bin_add(GST_BIN(p->pipeline), branch->bin)) {
++        gst_object_unref(branch->bin);
++        branch->bin = NULL;
++        return FALSE;
++    }
++
++    branch->sinkpad = gst_element_get_static_pad(branch->bin, "sink");
++    if (branch->sinkpad == NULL) {
++        g_printerr("%s branch has no sink pad\n", branch->name);
++        return FALSE;
++    }
++
++    if (kind == STREAM_VIDEO) {
++        GstElement *parser = gst_bin_get_by_name(
++            GST_BIN(branch->bin), "video_parser");
++        GstElement *sink = gst_bin_get_by_name(
++            GST_BIN(branch->bin), "video_sink");
++        GstPad *src_pad = parser != NULL
++                              ? gst_element_get_static_pad(parser, "src")
++                              : NULL;
++
++        if (src_pad == NULL) {
++            g_printerr("video branch has no parser source pad\n");
++            if (parser != NULL)
++                gst_object_unref(parser);
++            if (sink != NULL)
++                gst_object_unref(sink);
++            return FALSE;
++        }
++        gst_pad_add_probe(src_pad, GST_PAD_PROBE_TYPE_BUFFER,
++                          drop_corrupt_video, p, NULL);
++        gst_object_unref(src_pad);
++        gst_object_unref(parser);
++
++        if (sink != NULL) {
++            GstPad *sink_pad = gst_element_get_static_pad(sink, "sink");
++
++            if (sink_pad == NULL) {
++                g_printerr("video sink has no sink pad\n");
++                gst_object_unref(sink);
++                return FALSE;
++            }
++            gst_pad_add_probe(sink_pad, GST_PAD_PROBE_TYPE_BUFFER,
++                              video_ready, p, NULL);
++            gst_object_unref(sink_pad);
++
++            gst_object_unref(sink);
++        }
++    }
++    return TRUE;
++}
++
++static gboolean
++link_demux_pad(Player *p, GstPad *pad, Branch *branch, GstCaps *caps)
++{
++    GstPadLinkReturn result;
++    gchar *caps_text;
++
++    if (branch->srcpad != NULL)
++        return FALSE;
++
++    if (branch->links > 0) {
++        gst_pad_send_event(branch->sinkpad,
++                           gst_event_new_flush_start());
++        gst_pad_send_event(branch->sinkpad,
++                           gst_event_new_flush_stop(FALSE));
++    }
++    result = gst_pad_link(pad, branch->sinkpad);
++    if (result != GST_PAD_LINK_OK) {
++        caps_text = gst_caps_to_string(caps);
++        g_printerr("Could not link %s transport stream (%s): %s\n",
++                   branch->name, caps_text,
++                   gst_pad_link_get_name(result));
++        g_free(caps_text);
++        return FALSE;
++    }
++
++    branch->srcpad = gst_object_ref(pad);
++    branch->links++;
++    caps_text = gst_caps_to_string(caps);
++    g_print("Linked %s transport stream: %s\n", branch->name, caps_text);
++    g_free(caps_text);
++
++    if (branch->links > 1 && branch->kind == STREAM_VIDEO) {
++        g_atomic_int_set(&p->reset_video, TRUE);
++    }
++    return TRUE;
++}
++
++static void
++try_link_demux_pad(Player *p, GstPad *pad)
++{
++    GstCaps *caps;
++
++    if (gst_pad_is_linked(pad))
++        return;
++
++    caps = gst_pad_get_current_caps(pad);
++    if (caps == NULL)
++        caps = gst_pad_query_caps(pad, NULL);
++    if (caps == NULL || !gst_caps_is_fixed(caps)) {
++        if (caps != NULL)
++            gst_caps_unref(caps);
++        return;
++    }
++
++    const gchar *name =
++        gst_structure_get_name(gst_caps_get_structure(caps, 0));
++    if (g_str_equal(name, "video/x-h264"))
++        link_demux_pad(p, pad, &p->video, caps);
++    else if (g_str_has_prefix(name, "audio/")) {
++        /* An unconnected decodebin holds the entire pipeline in PAUSED. */
++        if (p->audio.bin == NULL &&
++            !branch_create(p, &p->audio, STREAM_AUDIO)) {
++            GST_ELEMENT_ERROR(p->pipeline, CORE, FAILED,
++                              ("Could not create audio branch"), (NULL));
++        } else if (link_demux_pad(p, pad, &p->audio, caps) &&
++                   !gst_element_sync_state_with_parent(p->audio.bin)) {
++            GST_ELEMENT_ERROR(p->pipeline, CORE, STATE_CHANGE,
++                              ("Could not start audio branch"), (NULL));
++        }
++    }
++    else
++        g_printerr("ignoring unsupported transport stream: %s\n", name);
++    gst_caps_unref(caps);
++}
++
++static void
++demux_pad_added(GstElement *demux, GstPad *pad, gpointer user_data)
++{
++    (void)demux;
++    try_link_demux_pad(user_data, pad);
++}
++
++static Branch *
++branch_for_pad(Player *p, GstPad *pad)
++{
++    if (pad == p->video.srcpad)
++        return &p->video;
++    if (pad == p->audio.srcpad)
++        return &p->audio;
++    return NULL;
++}
++
++static void
++relink_pending_demux_pads(Player *p)
++{
++    GstIterator *it;
++    GValue item = G_VALUE_INIT;
++    gboolean done = FALSE;
++
++    it = gst_element_iterate_src_pads(p->demux);
++    while (!done) {
++        switch (gst_iterator_next(it, &item)) {
++        case GST_ITERATOR_OK:
++            try_link_demux_pad(p, g_value_get_object(&item));
++            g_value_reset(&item);
++            break;
++        case GST_ITERATOR_RESYNC:
++            gst_iterator_resync(it);
++            break;
++        default:
++            done = TRUE;
++            break;
++        }
++    }
++    g_value_unset(&item);
++    gst_iterator_free(it);
++}
++
++static void
++demux_pad_removed(GstElement *demux, GstPad *pad, gpointer user_data)
++{
++    Player *p = user_data;
++    Branch *branch;
++
++    (void)demux;
++
++    /* GStreamer unlinks before emitting pad-removed. */
++    branch = branch_for_pad(p, pad);
++    if (branch != NULL) {
++        g_clear_object(&branch->srcpad);
++        g_print("%s transport stream went away, waiting for a "
++                "replacement\n", branch->name);
++        relink_pending_demux_pads(p);
++    }
++}
++
++static gboolean
++create_pipeline(Player *p)
++{
++    const Options *options = &p->options;
++    GstElement *source, *depay;
++    GstCaps *rtp_caps;
++
++    p->pipeline = gst_pipeline_new("wfd-player");
++    source = gst_element_factory_make("udpsrc", "transport_source");
++    p->jitter = gst_element_factory_make("rtpjitterbuffer",
++                                         "transport_jitter");
++    depay = gst_element_factory_make("rtpmp2tdepay", "transport_depay");
++    p->demux = gst_element_factory_make("tsdemux", "mpeg_ts_demux");
++    if (source == NULL || p->jitter == NULL || depay == NULL ||
++        p->demux == NULL) {
++        g_printerr("missing GStreamer element (udpsrc, rtpjitterbuffer, "
++                   "rtpmp2tdepay or tsdemux)\n");
++        if (source != NULL)
++            gst_object_unref(source);
++        if (depay != NULL)
++            gst_object_unref(depay);
++        g_clear_object(&p->jitter);
++        g_clear_object(&p->demux);
++        return FALSE;
++    }
++
++    rtp_caps = gst_caps_new_simple(
++        "application/x-rtp",
++        "media", G_TYPE_STRING, "video",
++        "clock-rate", G_TYPE_INT, 90000,
++        "encoding-name", G_TYPE_STRING, "MP2T",
++        "payload", G_TYPE_INT, 33,
++        NULL);
++    g_object_set(source,
++                 "address", options->bind_address,
++                 "port", options->port,
++                 "caps", rtp_caps,
++                 "buffer-size", 33554432,
++                 NULL);
++    gst_caps_unref(rtp_caps);
++
++    g_object_set(p->jitter,
++                 "latency", (guint)JITTER_LATENCY_MS,
++                 "do-lost", TRUE,
++                 "drop-on-latency", TRUE,
++                 NULL);
++
++    /* RTP already provides jitter buffering; tsdemux would add another delay. */
++    g_object_set(p->demux, "latency", 0, NULL);
++
++    gst_bin_add_many(GST_BIN(p->pipeline),
++                     source, p->jitter, depay, p->demux, NULL);
++    gst_object_ref(p->jitter);
++    gst_object_ref(p->demux);
++    if (!gst_element_link_many(source, p->jitter, depay, p->demux,
++                               NULL)) {
++        g_printerr("could not link the transport ingest\n");
++        return FALSE;
++    }
++
++    if (!branch_create(p, &p->video, STREAM_VIDEO))
++        return FALSE;
++
++    /* PipeWire clocks can stall before audio starts, blocking video. */
++    {
++        GstClock *clock = gst_system_clock_obtain();
++
++        gst_pipeline_use_clock(GST_PIPELINE(p->pipeline), clock);
++        gst_object_unref(clock);
++    }
++
++    g_signal_connect(p->demux, "pad-added",
++                     G_CALLBACK(demux_pad_added), p);
++    g_signal_connect(p->demux, "pad-removed",
++                     G_CALLBACK(demux_pad_removed), p);
++
++    p->bus = gst_element_get_bus(p->pipeline);
++    p->bus_watch = gst_bus_add_watch(p->bus, bus_message, p);
++    return TRUE;
++}
++
++static void
++remove_source(Player *p, guint *source_id)
++{
++    GSource *source;
++
++    if (*source_id != 0) {
++        source = g_main_context_find_source_by_id(p->context, *source_id);
++        if (source != NULL)
++            g_source_destroy(source);
++    }
++    *source_id = 0;
++}
++
++static guint
++attach_timeout(Player *p, guint interval_ms, GSourceFunc fn)
++{
++    GSource *source;
++    guint id;
++
++    source = g_timeout_source_new(interval_ms);
++    g_source_set_callback(source, fn, p, NULL);
++    id = g_source_attach(source, p->context);
++    g_source_unref(source);
++    return id;
++}
++
++static void
++destroy_pipeline(Player *p)
++{
++    remove_source(p, &p->keyframe_source);
++    remove_source(p, &p->bus_watch);
++
++    if (p->demux != NULL)
++        g_signal_handlers_disconnect_by_data(p->demux, p);
++    if (p->pipeline != NULL)
++        gst_element_set_state(p->pipeline, GST_STATE_NULL);
++
++    g_clear_object(&p->video.srcpad);
++    g_clear_object(&p->audio.srcpad);
++    if (p->bus != NULL)
++        gst_object_unref(p->bus);
++    if (p->video.sinkpad != NULL)
++        gst_object_unref(p->video.sinkpad);
++    if (p->audio.sinkpad != NULL)
++        gst_object_unref(p->audio.sinkpad);
++    if (p->jitter != NULL)
++        gst_object_unref(p->jitter);
++    if (p->demux != NULL)
++        gst_object_unref(p->demux);
++    if (p->pipeline != NULL)
++        gst_object_unref(p->pipeline);
++}
++
++static gpointer
++player_thread_fn(gpointer data)
++{
++    Player *p = data;
++    GstStateChangeReturn result;
++
++    g_main_context_push_thread_default(p->context);
++
++    if (create_pipeline(p)) {
++        result = gst_element_set_state(p->pipeline, GST_STATE_PLAYING);
++        if (result != GST_STATE_CHANGE_FAILURE) {
++            p->keyframe_source =
++                attach_timeout(p, KEYFRAME_INTERVAL_MS, request_keyframe);
++            g_print("Listening for RTP/MPEG-TS on %s:%d\n",
++                    p->options.bind_address, p->options.port);
++            g_main_loop_run(p->loop);
++        } else {
++            g_printerr("pipeline could not enter PLAYING\n");
++        }
++    }
++
++    destroy_pipeline(p);
++    g_main_context_pop_thread_default(p->context);
++
++    notify(SINK_PLAYER_EVENT_STOPPED);
++    close(p->notify_wfd);
++    return NULL;
++}
++
++static void
++free_options(Options *options)
++{
++    g_free(options->bind_address);
++    g_free(options->video_decoder);
++    g_free(options->video_caps);
++    g_free(options->video_sink);
++    g_free(options->audio_sink);
++    memset(options, 0, sizeof(*options));
++}
++
++int
++sink_player_start(const struct sink_player_config *config)
++{
++    static gsize gst_initialized;
++    int fds[2];
++
++    if (player.thread != NULL)
++        return -EALREADY;
++
++    if (g_once_init_enter(&gst_initialized)) {
++        gst_init(NULL, NULL);
++        g_once_init_leave(&gst_initialized, 1);
++    }
++    if (config->gst_debug != NULL)
++        gst_debug_set_threshold_from_string(config->gst_debug, TRUE);
++
++    if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) < 0)
++        return -errno;
++
++    memset(&player, 0, sizeof(player));
++    player.notify_rfd = fds[0];
++    player.notify_wfd = fds[1];
++    player.video_dropping = TRUE;
++
++    player.options.bind_address =
++        g_strdup(config->bind_address != NULL &&
++                 *config->bind_address != '\0'
++                     ? config->bind_address : "0.0.0.0");
++    player.options.port = config->port > 0 ? config->port : DEFAULT_PORT;
++    player.options.video_decoder =
++        g_strdup(config->video_decoder ? : "avdec_h264");
++    player.options.video_caps =
++        g_strdup(config->video_caps ? : "video/x-raw");
++    player.options.video_sink =
++        g_strdup(config->video_sink ? : "autovideosink");
++    player.options.audio_sink =
++        g_strdup(config->audio_sink ? : "autoaudiosink");
++
++    player.context = g_main_context_new();
++    player.loop = g_main_loop_new(player.context, FALSE);
++    player.thread = g_thread_new("sink-player", player_thread_fn, &player);
++    return 0;
++}
++
++int
++sink_player_notify_fd(void)
++{
++    return player.thread != NULL ? player.notify_rfd : -1;
++}
++
++bool
++sink_player_running(void)
++{
++    return player.thread != NULL;
++}
++
++void
++sink_player_set_paused(bool paused)
++{
++    if (player.thread == NULL)
++        return;
++    g_atomic_int_set(&player.paused, paused ? 1 : 0);
++}
++
++void
++sink_player_reset_video(void)
++{
++    if (player.thread != NULL)
++        g_atomic_int_set(&player.reset_video, TRUE);
++}
++
++static gboolean
++quit_loop(gpointer user_data)
++{
++    Player *p = user_data;
++
++    g_main_loop_quit(p->loop);
++    return G_SOURCE_REMOVE;
++}
++
++void
++sink_player_stop(void)
++{
++    GSource *source;
++
++    if (player.thread == NULL)
++        return;
++
++    source = g_idle_source_new();
++    g_source_set_callback(source, quit_loop, &player, NULL);
++    g_source_attach(source, player.context);
++    g_source_unref(source);
++
++    g_thread_join(player.thread);
++    player.thread = NULL;
++
++    g_main_loop_unref(player.loop);
++    g_main_context_unref(player.context);
++    close(player.notify_rfd);
++    player.notify_rfd = -1;
++    player.notify_wfd = -1;
++    free_options(&player.options);
++}
+--- /dev/null
++++ miraclecast/src/ctl/sink-player.h
+@@ -0,0 +1,35 @@
++#ifndef CTL_SINK_PLAYER_H
++#define CTL_SINK_PLAYER_H
++
++#include <stdbool.h>
++
++struct sink_player_config {
++	const char *bind_address;	/* NULL: 0.0.0.0 */
++	int port;			/* <= 0: 7236 */
++	const char *video_decoder;	/* NULL: avdec_h264 */
++	const char *video_caps;		/* NULL: video/x-raw */
++	const char *video_sink;		/* NULL: autovideosink */
++	const char *audio_sink;		/* NULL: autoaudiosink */
++	const char *gst_debug;		/* NULL: leave untouched */
++};
++
++/* One byte per event; reap STOPPED with sink_player_stop(). */
++#define SINK_PLAYER_EVENT_IDR 'I'
++#define SINK_PLAYER_EVENT_READY 'R'
++#define SINK_PLAYER_EVENT_STOPPED 'S'
++
++/* Construction failures arrive asynchronously as STOPPED. */
++int sink_player_start(const struct sink_player_config *config);
++
++/* Valid between sink_player_start() and sink_player_stop(). */
++int sink_player_notify_fd(void);
++
++bool sink_player_running(void);
++
++void sink_player_reset_video(void);
++
++void sink_player_set_paused(bool paused);
++
++void sink_player_stop(void);
++
++#endif /* CTL_SINK_PLAYER_H */

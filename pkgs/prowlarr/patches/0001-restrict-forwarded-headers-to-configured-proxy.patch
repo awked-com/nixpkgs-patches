@@ -1,0 +1,32 @@
+--- prowlarr.orig/src/NzbDrone.Host/Startup.cs
++++ prowlarr/src/NzbDrone.Host/Startup.cs
+@@ -32,7 +32,6 @@
+ using Prowlarr.Http.ErrorManagement;
+ using Prowlarr.Http.Frontend;
+ using Prowlarr.Http.Middleware;
+-using IPNetwork = Microsoft.AspNetCore.HttpOverrides.IPNetwork;
+ using LogLevel = Microsoft.Extensions.Logging.LogLevel;
+ 
+ namespace NzbDrone.Host
+@@ -60,12 +59,15 @@
+ 
+             services.Configure<ForwardedHeadersOptions>(options =>
+             {
+-                options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto | ForwardedHeaders.XForwardedHost;
+-                options.KnownNetworks.Add(new IPNetwork(IPAddress.Parse("10.0.0.0"), 8));
+-                options.KnownNetworks.Add(new IPNetwork(IPAddress.Parse("172.16.0.0"), 12));
+-                options.KnownNetworks.Add(new IPNetwork(IPAddress.Parse("192.168.0.0"), 16));
+-                options.KnownNetworks.Add(new IPNetwork(IPAddress.Parse("fc00::"), 7));
+-                options.KnownNetworks.Add(new IPNetwork(IPAddress.Parse("fe80::"), 10));
++                options.KnownNetworks.Clear();
++                options.KnownProxies.Clear();
++                options.ForwardedHeaders = ForwardedHeaders.None;
++                if (IPAddress.TryParse(Environment.GetEnvironmentVariable("PROWLARR_TRUSTED_PROXY"), out var proxy))
++                {
++                    options.KnownProxies.Add(proxy);
++                    options.ForwardLimit = 1;
++                    options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto | ForwardedHeaders.XForwardedHost;
++                }
+             });
+ 
+             services.AddRouting(options => options.LowercaseUrls = true);

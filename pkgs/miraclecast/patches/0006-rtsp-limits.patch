@@ -1,0 +1,65 @@
+--- miraclecast.orig/src/shared/rtsp.c
++++ miraclecast/src/shared/rtsp.c
+@@ -41,6 +41,9 @@
+ /* 5s default timeout for messages */
+ #define RTSP_DEFAULT_TIMEOUT (5ULL * 1000ULL * 1000ULL)
+ 
++#define RTSP_MAX_HEADER_SIZE (64U * 1024U)
++#define RTSP_MAX_BODY_SIZE (1024U * 1024U)
++
+ /* CSeq numbers have separate namespaces for locally and remotely generated
+  * messages. We use a single lookup-table, so mark all remotely generated
+  * cookies as such to avoid conflicts with local cookies. */
+@@ -69,6 +72,7 @@
+ 		struct rtsp_message *m;
+ 		struct shl_ring buf;
+ 		size_t buflen;
++		size_t header_size;
+ 
+ 		enum {
+ 			STATE_NEW,
+@@ -2097,6 +2101,9 @@
+ 		if (r < 0 || *next)
+ 			return -EINVAL;
+ 
++		if (clen > RTSP_MAX_BODY_SIZE)
++			return -EMSGSIZE;
++
+ 		/* overwrite previous lengths */
+ 		dec->remaining_body = clen;
+ 	} else if (h == dec->m->header_cseq) {
+@@ -2192,8 +2199,11 @@
+ 	case ' ':
+ 		/* If no msg has been started, yet, we ignore LWS for
+ 		 * compatibility reasons. Note that they're actually not
+-		 * allowed, but should be ignored by implementations. */
+-		++dec->buflen;
++		 * allowed, but should be ignored by implementations. Discard
++		 * them immediately so a whitespace-only stream cannot grow
++		 * the receive buffer. */
++		shl_ring_pull(&dec->buf, dec->buflen + 1);
++		dec->buflen = 0;
+ 		break;
+ 	case '$':
+ 		/* Interleaved data. Followed by 1 byte channel-id and 2-byte
+@@ -2211,6 +2221,7 @@
+ 		 * push the char into the buffer. Any char except LWS is fine
+ 		 * here. */
+ 		dec->state = STATE_HEADER;
++		dec->header_size = 1;
+ 		dec->remaining_body = 0;
+ 
+ 		shl_ring_pull(&dec->buf, dec->buflen);
+@@ -2496,6 +2507,12 @@
+ 	struct rtsp_parser *dec = &bus->parser;
+ 	int r = 0;
+ 
++	if (dec->state == STATE_HEADER || dec->state == STATE_HEADER_QUOTE) {
++		if (dec->header_size >= RTSP_MAX_HEADER_SIZE)
++			return -EMSGSIZE;
++		++dec->header_size;
++	}
++
+ 	switch (dec->state) {
+ 	case STATE_NEW:
+ 		r = parser_feed_char_new(bus, ch);

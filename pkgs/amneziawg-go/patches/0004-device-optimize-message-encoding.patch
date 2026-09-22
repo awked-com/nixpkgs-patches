@@ -1,0 +1,186 @@
+From 40beb02c2dafb9f27767a04e2f5779eca0a2da50 Mon Sep 17 00:00:00 2001
+From: Alexander Yastrebov <yastrebov.alex@gmail.com>
+Date: Sat, 17 May 2025 11:34:30 +0200
+Subject: [PATCH 4/4] device: optimize message encoding
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Optimize message encoding by eliminating binary.Write (which internally
+uses reflection) in favour of hand-rolled encoding.
+
+This is companion to 9e7529c3d2d0c54f4d5384c01645a9279e4740ae.
+
+Synthetic benchmark:
+
+    var packetSink []byte
+    func BenchmarkMessageInitiationMarshal(b *testing.B) {
+        var msg MessageInitiation
+        b.Run("binary.Write", func(b *testing.B) {
+            b.ReportAllocs()
+            for range b.N {
+                var buf [MessageInitiationSize]byte
+                writer := bytes.NewBuffer(buf[:0])
+                _ = binary.Write(writer, binary.LittleEndian, msg)
+                packetSink = writer.Bytes()
+            }
+        })
+        b.Run("binary.Encode", func(b *testing.B) {
+            b.ReportAllocs()
+            for range b.N {
+                packet := make([]byte, MessageInitiationSize)
+                _, _ = binary.Encode(packet, binary.LittleEndian, msg)
+                packetSink = packet
+            }
+        })
+        b.Run("marshal", func(b *testing.B) {
+            b.ReportAllocs()
+            for range b.N {
+                packet := make([]byte, MessageInitiationSize)
+                _ = msg.marshal(packet)
+                packetSink = packet
+            }
+        })
+    }
+
+Results:
+                                             │      -      │
+                                             │   sec/op    │
+    MessageInitiationMarshal/binary.Write-8    1.337µ ± 0%
+    MessageInitiationMarshal/binary.Encode-8   1.242µ ± 0%
+    MessageInitiationMarshal/marshal-8         53.05n ± 1%
+
+                                             │     -      │
+                                             │    B/op    │
+    MessageInitiationMarshal/binary.Write-8    368.0 ± 0%
+    MessageInitiationMarshal/binary.Encode-8   160.0 ± 0%
+    MessageInitiationMarshal/marshal-8         160.0 ± 0%
+
+                                             │     -      │
+                                             │ allocs/op  │
+    MessageInitiationMarshal/binary.Write-8    3.000 ± 0%
+    MessageInitiationMarshal/binary.Encode-8   1.000 ± 0%
+    MessageInitiationMarshal/marshal-8         1.000 ± 0%
+
+Signed-off-by: Alexander Yastrebov <yastrebov.alex@gmail.com>
+Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+(cherry picked from commit 264889f0bbdf9250bb8389a637dd5f38389bfe0b)
+---
+ device/noise-protocol.go | 45 ++++++++++++++++++++++++++++++++++++++++
+ device/send.go           | 16 ++++++--------
+ 2 files changed, 51 insertions(+), 10 deletions(-)
+
+--- amneziawg-go.orig/device/noise-protocol.go
++++ amneziawg-go/device/noise-protocol.go
+@@ -137,6 +137,22 @@
+ 	return nil
+ }
+ 
++func (msg *MessageInitiation) marshal(b []byte) error {
++	if len(b) != MessageInitiationSize {
++		return errMessageLengthMismatch
++	}
++
++	binary.LittleEndian.PutUint32(b, msg.Type)
++	binary.LittleEndian.PutUint32(b[4:], msg.Sender)
++	copy(b[8:], msg.Ephemeral[:])
++	copy(b[8+len(msg.Ephemeral):], msg.Static[:])
++	copy(b[8+len(msg.Ephemeral)+len(msg.Static):], msg.Timestamp[:])
++	copy(b[8+len(msg.Ephemeral)+len(msg.Static)+len(msg.Timestamp):], msg.MAC1[:])
++	copy(b[8+len(msg.Ephemeral)+len(msg.Static)+len(msg.Timestamp)+len(msg.MAC1):], msg.MAC2[:])
++
++	return nil
++}
++
+ func (msg *MessageResponse) unmarshal(b []byte) error {
+ 	if len(b) != MessageResponseSize {
+ 		return errMessageLengthMismatch
+@@ -153,6 +169,22 @@
+ 	return nil
+ }
+ 
++func (msg *MessageResponse) marshal(b []byte) error {
++	if len(b) != MessageResponseSize {
++		return errMessageLengthMismatch
++	}
++
++	binary.LittleEndian.PutUint32(b, msg.Type)
++	binary.LittleEndian.PutUint32(b[4:], msg.Sender)
++	binary.LittleEndian.PutUint32(b[8:], msg.Receiver)
++	copy(b[12:], msg.Ephemeral[:])
++	copy(b[12+len(msg.Ephemeral):], msg.Empty[:])
++	copy(b[12+len(msg.Ephemeral)+len(msg.Empty):], msg.MAC1[:])
++	copy(b[12+len(msg.Ephemeral)+len(msg.Empty)+len(msg.MAC1):], msg.MAC2[:])
++
++	return nil
++}
++
+ func (msg *MessageCookieReply) unmarshal(b []byte) error {
+ 	if len(b) != MessageCookieReplySize {
+ 		return errMessageLengthMismatch
+@@ -165,6 +197,19 @@
+ 
+ 	return nil
+ }
++
++func (msg *MessageCookieReply) marshal(b []byte) error {
++	if len(b) != MessageCookieReplySize {
++		return errMessageLengthMismatch
++	}
++
++	binary.LittleEndian.PutUint32(b, msg.Type)
++	binary.LittleEndian.PutUint32(b[4:], msg.Receiver)
++	copy(b[8:], msg.Nonce[:])
++	copy(b[8+len(msg.Nonce):], msg.Cookie[:])
++
++	return nil
++}
+ 
+ type Handshake struct {
+ 	state                     handshakeState
+--- amneziawg-go.orig/device/send.go
++++ amneziawg-go/device/send.go
+@@ -6,7 +6,6 @@
+ package device
+ 
+ import (
+-	"bytes"
+ 	"crypto/rand"
+ 	"encoding/binary"
+ 	"errors"
+@@ -154,9 +153,8 @@
+ 	crypt := buf[:padding]
+ 	rand.Read(crypt)
+ 
+-	writer := bytes.NewBuffer(buf[padding:padding])
+-	binary.Write(writer, binary.LittleEndian, msg)
+-	packet := writer.Bytes()
++	packet := buf[padding : padding+MessageInitiationSize]
++	_ = msg.marshal(packet)
+ 	peer.cookieGenerator.AddMacs(packet)
+ 
+ 	peer.timersAnyAuthenticatedPacketTraversal()
+@@ -204,9 +202,8 @@
+ 	crypt := buf[:padding]
+ 	rand.Read(crypt)
+ 
+-	writer := bytes.NewBuffer(buf[padding:padding])
+-	binary.Write(writer, binary.LittleEndian, response)
+-	packet := writer.Bytes()
++	packet := buf[padding : padding+MessageResponseSize]
++	_ = response.marshal(packet)
+ 	peer.cookieGenerator.AddMacs(packet)
+ 
+ 	err = peer.BeginSymmetricSession()
+@@ -263,9 +260,8 @@
+ 	crypt := buf[:padding]
+ 	rand.Read(crypt)
+ 
+-	writer := bytes.NewBuffer(buf[padding:padding])
+-	binary.Write(writer, binary.LittleEndian, reply)
+-	packet := writer.Bytes()
++	packet := buf[padding : padding+MessageCookieReplySize]
++	_ = reply.marshal(packet)
+ 
+ 	cip, err := device.HeaderProtectionCipher(crypt[:HeaderCipherNonceSize])
+ 	if err != nil {

@@ -1,0 +1,19 @@
+--- prometheus-qbittorrent-exporter.orig/main.go
++++ prometheus-qbittorrent-exporter/main.go
+@@ -4,6 +4,7 @@
+ 	"fmt"
+ 	"net"
+ 	"net/http"
++	"strconv"
+ 	"time"
+ 
+ 	app "qbit-exp/app"
+@@ -35,7 +36,7 @@
+ 		http.Redirect(w, req, app.Exporter.Path, http.StatusFound)
+ 	})
+ 
+-	addr := fmt.Sprintf("%s:%d", app.Exporter.Host, app.Exporter.Port)
++	addr := net.JoinHostPort(app.Exporter.Host, strconv.Itoa(app.Exporter.Port))
+ 
+ 	logger.Info("Starting the exporter")
+ 

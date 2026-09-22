@@ -1,0 +1,197 @@
+--- ddns-updater.orig/cmd/ddns-updater/main.go
++++ ddns-updater/cmd/ddns-updater/main.go
+@@ -189,7 +189,7 @@
+ 		Options: config.PubIP.ToDNSPOptions(),
+ 	}
+ 
+-	ipGetter, err := publicip.NewFetcher(dnsSettings, httpSettings)
++	ipGetter, err := publicip.NewFetcher(dnsSettings, httpSettings, config.PubIP.Interface)
+ 	if err != nil {
+ 		return err
+ 	}
+--- ddns-updater.orig/internal/config/pubip.go
++++ ddns-updater/internal/config/pubip.go
+@@ -17,6 +17,7 @@
+ )
+ 
+ type PubIP struct {
++	Interface         string
+ 	HTTPEnabled       *bool
+ 	HTTPIPProviders   []string
+ 	HTTPIPv4Providers []string
+@@ -27,11 +28,16 @@
+ }
+ 
+ func (p *PubIP) setDefaults() {
+-	p.HTTPEnabled = gosettings.DefaultPointer(p.HTTPEnabled, true)
++	if p.Interface != "" {
++		p.HTTPEnabled = new(bool)
++		p.DNSEnabled = new(bool)
++	} else {
++		p.HTTPEnabled = gosettings.DefaultPointer(p.HTTPEnabled, true)
++		p.DNSEnabled = gosettings.DefaultPointer(p.DNSEnabled, true)
++	}
+ 	p.HTTPIPProviders = gosettings.DefaultSlice(p.HTTPIPProviders, []string{all})
+ 	p.HTTPIPv4Providers = gosettings.DefaultSlice(p.HTTPIPv4Providers, []string{all})
+ 	p.HTTPIPv6Providers = gosettings.DefaultSlice(p.HTTPIPv6Providers, []string{all})
+-	p.DNSEnabled = gosettings.DefaultPointer(p.DNSEnabled, true)
+ 	p.DNSProviders = gosettings.DefaultSlice(p.DNSProviders, []string{all})
+ 	const defaultDNSTimeout = 3 * time.Second
+ 	p.DNSTimeout = gosettings.DefaultComparable(p.DNSTimeout, defaultDNSTimeout)
+@@ -68,6 +74,7 @@
+ func (p *PubIP) toLinesNode() (node *gotree.Node) {
+ 	node = gotree.New("Public IP fetching")
+ 
++	node.Appendf("Interface: %s", p.Interface)
+ 	node.Appendf("HTTP enabled: %s", gosettings.BoolToYesNo(p.HTTPEnabled))
+ 	if *p.HTTPEnabled {
+ 		childNode := node.Append("HTTP IP providers")
+@@ -234,6 +241,7 @@
+ }
+ 
+ func (p *PubIP) read(r *reader.Reader, warner Warner) (err error) {
++	p.Interface = strings.TrimSpace(r.String("PUBLICIP_INTERFACE"))
+ 	p.HTTPEnabled, p.DNSEnabled, err = getFetchers(r)
+ 	if err != nil {
+ 		return err
+--- ddns-updater.orig/pkg/publicip/publicip.go
++++ ddns-updater/pkg/publicip/publicip.go
+@@ -24,7 +24,8 @@
+ 
+ var ErrNoFetchTypeSpecified = errors.New("at least one fetcher type must be specified")
+ 
+-func NewFetcher(dnsSettings DNSSettings, httpSettings HTTPSettings) (f *Fetcher, err error) {
++func NewFetcher(dnsSettings DNSSettings, httpSettings HTTPSettings,
++	interfaceName string) (f *Fetcher, err error) {
+ 	settings := settings{
+ 		dns:  dnsSettings,
+ 		http: httpSettings,
+@@ -35,6 +36,10 @@
+ 		counter:  new(uint32),
+ 	}
+ 
++	if interfaceName != "" {
++		fetcher.fetchers = append(fetcher.fetchers, newInterfaceFetcher(interfaceName))
++	}
++
+ 	if settings.dns.Enabled {
+ 		subFetcher, err := dns.New(settings.dns.Options...)
+ 		if err != nil {
+--- /dev/null
++++ ddns-updater/pkg/publicip/interface.go
+@@ -0,0 +1,73 @@
++package publicip
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"net/netip"
++)
++
++type interfaceFetcher struct {
++	name string
++}
++
++func newInterfaceFetcher(name string) *interfaceFetcher {
++	return &interfaceFetcher{name: name}
++}
++
++func (f *interfaceFetcher) IP(ctx context.Context) (netip.Addr, error) {
++	return f.IP4(ctx)
++}
++
++func (f *interfaceFetcher) IP4(ctx context.Context) (netip.Addr, error) {
++	return f.address(ctx, true)
++}
++
++func (f *interfaceFetcher) IP6(ctx context.Context) (netip.Addr, error) {
++	return f.address(ctx, false)
++}
++
++func (f *interfaceFetcher) address(ctx context.Context, ipv4 bool) (netip.Addr, error) {
++	if err := ctx.Err(); err != nil {
++		return netip.Addr{}, err
++	}
++
++	iface, err := net.InterfaceByName(f.name)
++	if err != nil {
++		return netip.Addr{}, fmt.Errorf("finding interface %q: %w", f.name, err)
++	}
++
++	addresses, err := iface.Addrs()
++	if err != nil {
++		return netip.Addr{}, fmt.Errorf("listing addresses on interface %q: %w", f.name, err)
++	}
++
++	address, err := selectInterfaceAddress(addresses, ipv4)
++	if err != nil {
++		family := "IPv6"
++		if ipv4 {
++			family = "IPv4"
++		}
++		return netip.Addr{}, fmt.Errorf("finding global unicast %s address on interface %q: %w",
++			family, f.name, err)
++	}
++	return address, nil
++}
++
++var errNoInterfaceAddress = errors.New("no matching address")
++
++func selectInterfaceAddress(addresses []net.Addr, ipv4 bool) (netip.Addr, error) {
++	for _, address := range addresses {
++		prefix, err := netip.ParsePrefix(address.String())
++		if err != nil {
++			continue
++		}
++
++		ip := prefix.Addr().Unmap()
++		if ip.Is4() == ipv4 && ip.IsGlobalUnicast() {
++			return ip, nil
++		}
++	}
++	return netip.Addr{}, errNoInterfaceAddress
++}
+--- /dev/null
++++ ddns-updater/pkg/publicip/interface_test.go
+@@ -0,0 +1,39 @@
++package publicip
++
++import (
++	"net"
++	"net/netip"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestSelectInterfaceAddress(t *testing.T) {
++	t.Parallel()
++
++	addresses := []net.Addr{
++		&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)},
++		&net.IPNet{IP: net.ParseIP("2001:db8::1"), Mask: net.CIDRMask(64, 128)},
++		&net.IPNet{IP: net.ParseIP("192.0.2.10"), Mask: net.CIDRMask(24, 32)},
++	}
++
++	ipv4, err := selectInterfaceAddress(addresses, true)
++	require.NoError(t, err)
++	assert.Equal(t, netip.MustParseAddr("192.0.2.10"), ipv4)
++
++	ipv6, err := selectInterfaceAddress(addresses, false)
++	require.NoError(t, err)
++	assert.Equal(t, netip.MustParseAddr("2001:db8::1"), ipv6)
++}
++
++func TestSelectInterfaceAddressMissing(t *testing.T) {
++	t.Parallel()
++
++	addresses := []net.Addr{
++		&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)},
++	}
++
++	_, err := selectInterfaceAddress(addresses, true)
++	assert.ErrorIs(t, err, errNoInterfaceAddress)
++}

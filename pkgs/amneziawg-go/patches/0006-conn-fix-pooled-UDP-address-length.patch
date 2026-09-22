@@ -1,0 +1,24 @@
+Subject: conn: resize pooled UDP addresses before copying
+
+IPv4 sends return a four-byte IP slice to udpAddrPool. A later IPv6
+send copies only four bytes if the slice is expanded after copy, leaving
+a stale twelve-byte tail and silently sending to the wrong destination.
+Resize before copying for both address families.
+
+--- amneziawg-go.orig/conn/bind_std.go
++++ amneziawg-go/conn/bind_std.go
+@@ -367,12 +367,12 @@
+ 	defer s.udpAddrPool.Put(ua)
+ 	if is6 {
+ 		as16 := endpoint.DstIP().As16()
+-		copy(ua.IP, as16[:])
+ 		ua.IP = ua.IP[:16]
++		copy(ua.IP, as16[:])
+ 	} else {
+ 		as4 := endpoint.DstIP().As4()
+-		copy(ua.IP, as4[:])
+ 		ua.IP = ua.IP[:4]
++		copy(ua.IP, as4[:])
+ 	}
+ 	ua.Port = int(endpoint.(*StdNetEndpoint).Port())
+ 	var (

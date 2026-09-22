@@ -1,0 +1,569 @@
+--- miraclecast.orig/src/dhcp/client.c
++++ miraclecast/src/dhcp/client.c
+@@ -46,11 +46,11 @@
+ #include "common.h"
+ #include "ipv4ll.h"
+ 
+-#define DISCOVER_TIMEOUT 5
+-#define DISCOVER_RETRIES 6
++#define DISCOVER_TIMEOUT_MS 1000
++#define DISCOVER_RETRIES 30
+ 
+-#define REQUEST_TIMEOUT 5
+-#define REQUEST_RETRIES 3
++#define REQUEST_TIMEOUT_MS 1000
++#define REQUEST_RETRIES 15
+ 
+ typedef enum _listen_mode {
+ 	L_NONE,
+@@ -1310,6 +1310,10 @@
+ 		/* packet is bigger than sizeof(packet), we did partial read */
+ 		return -1;
+ 
++	if (ntohs(packet.ip.tot_len) < sizeof(packet.ip) + sizeof(packet.udp) +
++					offsetof(struct dhcp_packet, options))
++		return -1;
++
+ 	/* ignore any extra garbage bytes */
+ 	bytes = ntohs(packet.ip.tot_len);
+ 
+@@ -1330,6 +1334,8 @@
+ 	if (check && check != dhcp_checksum(&packet, bytes))
+ 		return -1;
+ 
++	/* Option parsing scans beyond the received payload. */
++	memset(dhcp_pkt, 0, sizeof(*dhcp_pkt));
+ 	memcpy(dhcp_pkt, &packet.data, bytes - (sizeof(packet.ip) +
+ 							sizeof(packet.udp)));
+ 
+@@ -1590,11 +1596,11 @@
+ 
+ 	send_request(dhcp_client);
+ 
+-	dhcp_client->timeout = g_timeout_add_seconds_full(G_PRIORITY_HIGH,
+-							REQUEST_TIMEOUT,
+-							request_timeout,
+-							dhcp_client,
+-							NULL);
++	dhcp_client->timeout = g_timeout_add_full(G_PRIORITY_HIGH,
++						 REQUEST_TIMEOUT_MS,
++						 request_timeout,
++						 dhcp_client,
++						 NULL);
+ }
+ 
+ static uint32_t get_lease(struct dhcp_packet *packet)
+@@ -1603,7 +1609,7 @@
+ 	uint32_t lease_seconds;
+ 
+ 	option = dhcp_get_option(packet, DHCP_LEASE_TIME);
+-	if (!option)
++	if (!option || option[OPT_LEN - OPT_DATA] != sizeof(lease_seconds))
+ 		return 3600;
+ 
+ 	lease_seconds = get_be32(option);
+@@ -2318,8 +2324,17 @@
+ 		}
+ 	} else {
+ 		message_type = dhcp_get_option(&packet, DHCP_MESSAGE_TYPE);
+-		if (!message_type)
++		if (!message_type || message_type[OPT_LEN - OPT_DATA] != 1)
+ 			return TRUE;
++
++		if ((dhcp_client->state == INIT_SELECTING &&
++						*message_type == DHCPOFFER) ||
++		    (dhcp_client->state == REBOOTING && *message_type == DHCPACK)) {
++			server_id = dhcp_get_option(&packet, DHCP_SERVER_ID);
++			if (!server_id || server_id[OPT_LEN - OPT_DATA] !=
++							sizeof(dhcp_client->server_ip))
++				return TRUE;
++		}
+ 	}
+ 
+ 	if (!message_type && !client_id)
+@@ -2338,8 +2353,7 @@
+ 		dhcp_client->timeout = 0;
+ 		dhcp_client->retry_times = 0;
+ 
+-		option = dhcp_get_option(&packet, DHCP_SERVER_ID);
+-		dhcp_client->server_ip = get_be32(option);
++		dhcp_client->server_ip = get_be32(server_id);
+ 		dhcp_client->requested_ip = ntohl(packet.yiaddr);
+ 
+ 		dhcp_client->state = REQUESTING;
+@@ -2365,11 +2379,8 @@
+ 			g_free(dhcp_client->assigned_ip);
+ 			dhcp_client->assigned_ip = get_ip(packet.yiaddr);
+ 
+-			if (dhcp_client->state == REBOOTING) {
+-				option = dhcp_get_option(&packet,
+-							DHCP_SERVER_ID);
+-				dhcp_client->server_ip = get_be32(option);
+-			}
++			if (dhcp_client->state == REBOOTING)
++				dhcp_client->server_ip = get_be32(server_id);
+ 
+ 			/* Address should be set up here */
+ 			if (dhcp_client->lease_available_cb)
+@@ -2797,21 +2808,20 @@
+ 		dhcp_client->state = REBOOTING;
+ 		send_request(dhcp_client);
+ 
+-		dhcp_client->timeout = g_timeout_add_seconds_full(
+-								G_PRIORITY_HIGH,
+-								REQUEST_TIMEOUT,
+-								reboot_timeout,
+-								dhcp_client,
+-								NULL);
++		dhcp_client->timeout = g_timeout_add_full(G_PRIORITY_HIGH,
++							 REQUEST_TIMEOUT_MS,
++							 reboot_timeout,
++							 dhcp_client,
++							 NULL);
+ 		return 0;
+ 	}
+ 	send_discover(dhcp_client, addr);
+ 
+-	dhcp_client->timeout = g_timeout_add_seconds_full(G_PRIORITY_HIGH,
+-							DISCOVER_TIMEOUT,
+-							discover_timeout,
+-							dhcp_client,
+-							NULL);
++	dhcp_client->timeout = g_timeout_add_full(G_PRIORITY_HIGH,
++						 DISCOVER_TIMEOUT_MS,
++						 discover_timeout,
++						 dhcp_client,
++						 NULL);
+ 	return 0;
+ }
+ 
+--- miraclecast.orig/src/dhcp/dhcp.c
++++ miraclecast/src/dhcp/dhcp.c
+@@ -57,6 +57,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <stdint.h>
+ #include <sys/epoll.h>
+ #include <sys/ioctl.h>
+ #include <sys/signalfd.h>
+@@ -72,6 +73,7 @@
+ 
+ static const char *arg_netdev;
+ static const char *arg_ip_binary = XSTR(IP_BINARY);
++static const char *arg_route_table;
+ static bool arg_server;
+ static char arg_local[INET_ADDRSTRLEN];
+ static char arg_gateway[INET_ADDRSTRLEN];
+@@ -79,6 +81,9 @@
+ static char arg_subnet[INET_ADDRSTRLEN];
+ static char arg_from[INET_ADDRSTRLEN];
+ static char arg_to[INET_ADDRSTRLEN];
++static char arg_static_address[INET_ADDRSTRLEN];
++static char arg_static_gateway[INET_ADDRSTRLEN];
++static char arg_static_subnet[INET_ADDRSTRLEN];
+ static int arg_comm = -1;
+ 
+ struct manager {
+@@ -139,6 +144,146 @@
+ 	free(msg);
+ }
+ 
++static int run_ip(char *argv[])
++{
++	int status;
++	pid_t pid, rp;
++
++	pid = fork();
++	if (pid < 0)
++		return log_ERRNO();
++	if (!pid) {
++		dup2(2, 1);
++		execve(argv[0], argv, environ);
++		_exit(1);
++	}
++
++	do {
++		rp = waitpid(pid, &status, 0);
++	} while (rp < 0 && errno == EINTR);
++
++	if (rp != pid || !WIFEXITED(status) || WEXITSTATUS(status))
++		return -EFAULT;
++
++	return 0;
++}
++
++static int network_prefix(const char *address, char *prefix, size_t size)
++{
++	const char *slash;
++	char host[INET_ADDRSTRLEN], network[INET_ADDRSTRLEN];
++	struct in_addr ip, mask, net;
++	char *end;
++	unsigned long prefix_len;
++	uint32_t mask_bits;
++	bool zero_seen = false;
++	int host_len, bits, r, bit;
++
++	slash = strchr(address, '/');
++	if (!slash || slash == address)
++		goto error;
++
++	host_len = slash - address;
++	if (host_len >= (int)sizeof(host))
++		goto error;
++	memcpy(host, address, host_len);
++	host[host_len] = 0;
++
++	if (inet_pton(AF_INET, host, &ip) != 1)
++		goto error;
++
++	if (strchr(slash + 1, '.')) {
++		if (inet_pton(AF_INET, slash + 1, &mask) != 1)
++			goto error;
++	} else {
++		errno = 0;
++		prefix_len = strtoul(slash + 1, &end, 10);
++		if (errno || end == slash + 1 || *end || prefix_len > 32)
++			goto error;
++
++		mask_bits = prefix_len ? UINT32_MAX << (32 - prefix_len) : 0;
++		mask.s_addr = htonl(mask_bits);
++	}
++
++	mask_bits = ntohl(mask.s_addr);
++	bits = 0;
++	for (bit = 31; bit >= 0; --bit) {
++		if (mask_bits & (UINT32_C(1) << bit)) {
++			if (zero_seen)
++				goto error;
++			++bits;
++		} else {
++			zero_seen = true;
++		}
++	}
++
++	net.s_addr = ip.s_addr & mask.s_addr;
++	if (!inet_ntop(AF_INET, &net, network, sizeof(network)))
++		goto error;
++
++	r = snprintf(prefix, size, "%s/%d", network, bits);
++	if (r < 0 || (size_t)r >= size)
++		goto error;
++
++	return 0;
++
++error:
++	log_error("invalid address prefix: %s", address);
++	return -EINVAL;
++}
++
++static int install_if_route(const char *address)
++{
++	char prefix[INET_ADDRSTRLEN + 4];
++	char *argv[] = {
++		(char*)arg_ip_binary,
++		(char*)"route",
++		(char*)"replace",
++		prefix,
++		(char*)"dev",
++		(char*)arg_netdev,
++		(char*)"table",
++		(char*)arg_route_table,
++		NULL,
++	};
++	int r;
++
++	if (!arg_route_table)
++		return 0;
++
++	r = network_prefix(address, prefix, sizeof(prefix));
++	if (r < 0)
++		return r;
++
++	r = run_ip(argv);
++	if (r < 0)
++		log_error("cannot install P2P route %s in table %s",
++			  prefix, arg_route_table);
++
++	return r;
++}
++
++static void flush_if_routes(void)
++{
++	char *argv[] = {
++		(char*)arg_ip_binary,
++		(char*)"route",
++		(char*)"flush",
++		(char*)"dev",
++		(char*)arg_netdev,
++		(char*)"table",
++		(char*)arg_route_table,
++		NULL,
++	};
++
++	if (!arg_route_table)
++		return;
++
++	if (run_ip(argv) < 0)
++		log_debug("no existing P2P route to flush from table %s",
++			  arg_route_table);
++}
++
+ static int flush_if_addr(void)
+ {
+ 	char *argv[64];
+@@ -146,6 +291,8 @@
+ 	pid_t pid, rp;
+ 	sigset_t mask;
+ 
++	flush_if_routes();
++
+ 	pid = fork();
+ 	if (pid < 0) {
+ 		return log_ERRNO();
+@@ -218,6 +365,7 @@
+ 		argv[i++] = (char*)addr;
+ 		argv[i++] = "dev";
+ 		argv[i++] = (char*)arg_netdev;
++		argv[i++] = "noprefixroute";
+ 		argv[i] = NULL;
+ 
+ 		execve(argv[0], argv, environ);
+@@ -240,6 +388,10 @@
+ 		return -EFAULT;
+ 	}
+ 
++	r = install_if_route(addr);
++	if (r < 0)
++		return r;
++
+ 	log_debug("successfully set local if-addr %s via %s",
+ 		  addr, arg_ip_binary);
+ 
+@@ -668,9 +820,34 @@
+ 
+ static int manager_run(struct manager *m)
+ {
++	char *address;
+ 	int r;
+ 
+ 	if (!arg_server) {
++		if (arg_static_address[0]) {
++			r = asprintf(&address, "%s/%s",
++				     arg_static_address,
++				     arg_static_subnet);
++			if (r < 0)
++				return log_ENOMEM();
++
++			r = flush_if_addr();
++			if (r >= 0)
++				r = add_if_addr(address);
++			free(address);
++
++			if (r >= 0) {
++				log_info("using address supplied by wpa_supplicant");
++				writef_comm("L:%s", arg_static_address);
++				writef_comm("S:%s", arg_static_subnet);
++				writef_comm("G:%s", arg_static_gateway);
++				g_main_loop_run(m->loop);
++				return 0;
++			}
++
++			log_warning("cannot use address supplied by wpa_supplicant; falling back to DHCP");
++		}
++
+ 		log_info("running dhcp client on %s via '%s'",
+ 			 arg_netdev, arg_ip_binary);
+ 
+@@ -724,12 +901,12 @@
+ 	return -EINVAL;
+ }
+ 
+-static int make_subnet(char *buf, const char *subnet)
++static int normalize_address(char *buf, const char *address, const char *name)
+ {
+ 	int r;
+ 	struct in_addr addr;
+ 
+-	r = inet_pton(AF_INET, subnet, &addr);
++	r = inet_pton(AF_INET, address, &addr);
+ 	if (r != 1)
+ 		goto error;
+ 
+@@ -738,7 +915,7 @@
+ 	return 0;
+ 
+ error:
+-	log_error("Invalid address --subnet=%s", subnet);
++	log_error("Invalid address --%s=%s", name, address);
+ 	return -EINVAL;
+ }
+ 
+@@ -754,8 +931,14 @@
+ 	       "\n"
+ 	       "     --netdev <dev>         Network device to run on\n"
+ 	       "     --ip-binary <path>     Path to 'ip' binary [default: "XSTR(IP_BINARY)"]\n"
++	       "     --route-table <id>     Install P2P connected routes in this table\n"
+ 	       "     --comm-fd <int>        Comm-socket FD passed through execve()\n"
+ 	       "\n"
++	       "Client Fast Path:\n"
++	       "     --static-address <addr>  Local address supplied by wpa_supplicant\n"
++	       "     --static-gateway <addr>  Group-owner address supplied by wpa_supplicant\n"
++	       "     --static-subnet <mask>   Subnet mask supplied by wpa_supplicant\n"
++	       "\n"
+ 	       "Server Options:\n"
+ 	       "     --server               Run as DHCP server instead of client\n"
+ 	       "     --prefix <net-prefix>  Network prefix [default: 192.168.77]\n"
+@@ -780,7 +963,11 @@
+ 
+ 		ARG_NETDEV,
+ 		ARG_IP_BINARY,
++		ARG_ROUTE_TABLE,
+ 		ARG_COMM_FD,
++		ARG_STATIC_ADDRESS,
++		ARG_STATIC_GATEWAY,
++		ARG_STATIC_SUBNET,
+ 
+ 		ARG_SERVER,
+ 		ARG_PREFIX,
+@@ -800,7 +987,11 @@
+ 
+ 		{ "netdev",	required_argument,	NULL,	ARG_NETDEV },
+ 		{ "ip-binary",	required_argument,	NULL,	ARG_IP_BINARY },
++		{ "route-table",	required_argument,	NULL,	ARG_ROUTE_TABLE },
+ 		{ "comm-fd",	required_argument,	NULL,	ARG_COMM_FD },
++		{ "static-address", required_argument,	NULL,	ARG_STATIC_ADDRESS },
++		{ "static-gateway", required_argument,	NULL,	ARG_STATIC_GATEWAY },
++		{ "static-subnet", required_argument,	NULL,	ARG_STATIC_SUBNET },
+ 
+ 		{ "server",	no_argument,		NULL,	ARG_SERVER },
+ 		{ "prefix",	required_argument,	NULL,	ARG_PREFIX },
+@@ -815,6 +1006,8 @@
+ 	int c, r;
+ 	const char *prefix = NULL, *local = NULL, *gateway = NULL;
+ 	const char *dns = NULL, *subnet = NULL, *from = NULL, *to = NULL;
++	const char *static_address = NULL, *static_gateway = NULL;
++	const char *static_subnet = NULL;
+ 
+ 	while ((c = getopt_long(argc, argv, "hs:", options, NULL)) >= 0) {
+ 		switch (c) {
+@@ -838,9 +1031,21 @@
+ 		case ARG_IP_BINARY:
+ 			arg_ip_binary = optarg;
+ 			break;
++		case ARG_ROUTE_TABLE:
++			arg_route_table = optarg;
++			break;
+ 		case ARG_COMM_FD:
+ 			arg_comm = atoi(optarg);
+ 			break;
++		case ARG_STATIC_ADDRESS:
++			static_address = optarg;
++			break;
++		case ARG_STATIC_GATEWAY:
++			static_gateway = optarg;
++			break;
++		case ARG_STATIC_SUBNET:
++			static_subnet = optarg;
++			break;
+ 
+ 		case ARG_SERVER:
+ 			arg_server = true;
+@@ -894,7 +1099,36 @@
+ 			log_error("server option given, but running as client");
+ 			return -EINVAL;
+ 		}
++
++		if (!!static_address != !!static_gateway ||
++		    !!static_address != !!static_subnet) {
++			log_error("static address, gateway, and subnet must be supplied together");
++			return -EINVAL;
++		}
++
++		if (static_address) {
++			r = normalize_address(arg_static_address,
++					      static_address,
++					      "static-address");
++			if (r < 0)
++				return -EINVAL;
++			r = normalize_address(arg_static_gateway,
++					      static_gateway,
++					      "static-gateway");
++			if (r < 0)
++				return -EINVAL;
++			r = normalize_address(arg_static_subnet,
++					      static_subnet,
++					      "static-subnet");
++			if (r < 0)
++				return -EINVAL;
++		}
+ 	} else {
++		if (static_address || static_gateway || static_subnet) {
++			log_error("client option given, but running as server");
++			return -EINVAL;
++		}
++
+ 		r = make_address(arg_local, prefix, local ? : "1", "local");
+ 		if (r < 0)
+ 			return -EINVAL;
+@@ -905,7 +1139,9 @@
+ 		r = make_address(arg_dns, prefix, dns ? : "1", "dns");
+ 		if (r < 0)
+ 			return -EINVAL;
+-		r = make_subnet(arg_subnet, subnet ? : "255.255.255.0");
++		r = normalize_address(arg_subnet,
++				      subnet ? : "255.255.255.0",
++				      "subnet");
+ 		if (r < 0)
+ 			return -EINVAL;
+ 		r = make_address(arg_from, prefix, from ? : "100", "from");
+--- miraclecast.orig/src/dhcp/common.c
++++ miraclecast/src/dhcp/common.c
+@@ -76,6 +76,7 @@
+ 	int len, rem;
+ 	uint8_t *optionptr;
+ 	uint8_t overload = 0;
++	bool allow_overload = true;
+ 
+ 	/* option bytes: [code][len][data1][data2]..[dataLEN] */
+ 	optionptr = packet->options;
+@@ -94,6 +95,7 @@
+ 		}
+ 
+ 		if (optionptr[OPT_CODE] == DHCP_END) {
++			allow_overload = false;
+ 			if (overload & FILE_FIELD) {
+ 				overload &= ~FILE_FIELD;
+ 
+@@ -113,18 +115,23 @@
+ 			break;
+ 		}
+ 
+-		len = 2 + optionptr[OPT_LEN];
++		if (rem < OPT_DATA)
++			return NULL;
++		len = OPT_DATA + optionptr[OPT_LEN];
++		if (len > rem)
++			return NULL;
+ 
+-		rem -= len;
+-		if (rem < 0)
+-			continue; /* complain and return NULL */
++		if (optionptr[OPT_CODE] == DHCP_OPTION_OVERLOAD) {
++			/* Only main options may select overloaded fields. */
++			if (!allow_overload || optionptr[OPT_LEN] != 1)
++				return NULL;
++			overload |= optionptr[OPT_DATA];
++		}
+ 
+ 		if (optionptr[OPT_CODE] == code)
+-			return optionptr + OPT_DATA;
+-
+-		if (optionptr[OPT_CODE] == DHCP_OPTION_OVERLOAD)
+-			overload |= optionptr[OPT_DATA];
++			return optionptr[OPT_LEN] ? optionptr + OPT_DATA : NULL;
+ 
++		rem -= len;
+ 		optionptr += len;
+ 	}
+ 

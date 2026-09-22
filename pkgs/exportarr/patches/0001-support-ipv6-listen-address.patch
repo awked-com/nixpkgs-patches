@@ -1,0 +1,23 @@
+--- exportarr.orig/internal/commands/root.go
++++ exportarr/internal/commands/root.go
+@@ -3,9 +3,11 @@
+ import (
+ 	"context"
+ 	"fmt"
++	"net"
+ 	"net/http"
+ 	"os"
+ 	"os/signal"
++	"strconv"
+ 	"syscall"
+ 	"time"
+ 
+@@ -145,7 +147,7 @@
+ 	zap.S().Infow("Starting HTTP Server",
+ 		"interface", conf.Interface,
+ 		"port", conf.Port)
+-	srv.Addr = fmt.Sprintf("%s:%d", conf.Interface, conf.Port)
++	srv.Addr = net.JoinHostPort(conf.Interface, strconv.Itoa(conf.Port))
+ 
+ 	wrappedMux := handlers.RecoveryHandler(mux)
+ 	wrappedMux = handlers.MetricsHandler(conf, registry, wrappedMux)

@@ -1,0 +1,49 @@
+Description: Renew nftset timeouts when another DNS answer refreshes an address.
+ Plain add does not renew an existing element's expiration. Recreate the element
+ in one nftables transaction, preserving the set's configured default timeout
+ and avoiding a packet-visible gap. Untimed sets keep their existing behavior.
+--- dnsmasq.orig/src/nftset.c
++++ dnsmasq/src/nftset.c
+@@ -25,7 +25,7 @@
+ #include <arpa/inet.h>
+ 
+ static struct nft_ctx *ctx = NULL;
+-static const char *cmd_add = "add element %s { %s }";
++static const char *cmd_add = "destroy element %s { %s }; add element %s { %s }";
+ static const char *cmd_del = "delete element %s { %s }";
+ 
+ void nftset_init()
+@@ -61,22 +61,20 @@
+       setname += 2;
+     }
+   
+-  if (cmd_buf_sz == 0)
+-    new_sz = 150; /* initial allocation */
+-  else
+-    new_sz = snprintf(cmd_buf, cmd_buf_sz, cmd, setname, daemon->addrbuff);
+-  
+-  if (new_sz > cmd_buf_sz)
++  /* Replacing an element in one transaction refreshes timed sets without a
++     packet-visible gap. Size for both commands, including full IPv6 addresses. */
++  new_sz = snprintf(NULL, 0, cmd, setname, daemon->addrbuff,
++                    setname, daemon->addrbuff);
++  if (new_sz >= cmd_buf_sz)
+     {
+-      if (!(new = whine_malloc(new_sz + 10)))
+-	return 0;
+-
+-      if (cmd_buf)
+-	free(cmd_buf);
++      if (!(new = whine_malloc(new_sz + 1)))
++        return 0;
++      free(cmd_buf);
+       cmd_buf = new;
+-      cmd_buf_sz = new_sz + 10;
+-      snprintf(cmd_buf, cmd_buf_sz, cmd, setname, daemon->addrbuff);
++      cmd_buf_sz = new_sz + 1;
+     }
++  snprintf(cmd_buf, cmd_buf_sz, cmd, setname, daemon->addrbuff,
++           setname, daemon->addrbuff);
+ 
+   ret = nft_run_cmd_from_buffer(ctx, cmd_buf);
+   err = nft_ctx_get_error_buffer(ctx);

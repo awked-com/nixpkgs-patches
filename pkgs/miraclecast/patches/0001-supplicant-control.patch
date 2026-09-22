@@ -1,0 +1,71 @@
+--- miraclecast.orig/src/shared/wpas.c
++++ miraclecast/src/shared/wpas.c
+@@ -27,6 +27,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/socket.h>
++#include <sys/stat.h>
+ #include <sys/timerfd.h>
+ #include <sys/types.h>
+ #include <sys/un.h>
+@@ -496,7 +497,16 @@
+ 	if (m->sealed)
+ 		return 0;
+ 
+-	r = shl_qstr_join(m->argv, &str);
++	if (m->argc == 3 &&
++	    !strcmp(m->argv[0], "SET") &&
++	    !strcmp(m->argv[1], "device_name")) {
++		str = shl_strjoin(m->argv[0], " ",
++				  m->argv[1], " ",
++				  m->argv[2], NULL);
++		r = str ? strlen(str) : -ENOMEM;
++	} else {
++		r = shl_qstr_join(m->argv, &str);
++	}
+ 	if (r < 0)
+ 		return r;
+ 
+@@ -914,15 +924,22 @@
+ 	 * lets just use this internal counter and blame
+ 	 * wpa_supplicant.. Yey! */
+ 	counter = ++real_counter;
++	const char *client_dir;
++	bool public_client = false;
+ 
+ 	memset(&src, 0, sizeof(src));
+ 	src.sun_family = AF_UNIX;
+ 
+-	snprintf(name,
+-		 UNIX_PATH_MAX - 1,
+-		 CTRL_PATH_TEMPLATE,
+-		 (int)getpid(),
+-		 counter);
++	client_dir = getenv("MIRACLECAST_WPA_CLIENT_DIR");
++	if (client_dir && *client_dir) {
++		snprintf(name, UNIX_PATH_MAX - 1,
++			 "%s/.miracle-wpas-%d-%lu", client_dir,
++			 (int)getpid(), counter);
++		public_client = true;
++	} else {
++		snprintf(name, UNIX_PATH_MAX - 1, CTRL_PATH_TEMPLATE,
++			 (int)getpid(), counter);
++	}
+ 	name[UNIX_PATH_MAX - 1] = 0;
+ 
+ try_again:
+@@ -939,6 +956,14 @@
+ 		return -errno;
+ 	}
+ 
++	if (public_client) {
++		/* The other user needs sendto() access; fchmod ignores UNIX socket inodes. */
++		r = chmod(name, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
++				  S_IROTH | S_IWOTH);
++		if (r < 0)
++			return -errno;
++	}
++
+ 	return 0;
+ }
+ 

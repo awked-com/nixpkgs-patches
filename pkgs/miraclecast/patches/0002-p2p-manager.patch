@@ -1,0 +1,1064 @@
+--- miraclecast.orig/src/wifi/wifid-dbus.c
++++ miraclecast/src/wifi/wifid-dbus.c
+@@ -257,16 +257,17 @@
+ 
+ static const sd_bus_vtable peer_dbus_vtable[] = {
+ 	SD_BUS_VTABLE_START(0),
++	/* sd-bus otherwise requires CAP_SYS_ADMIN, even with a D-Bus policy grant. */
+ 	SD_BUS_METHOD("Connect",
+ 		      "ss",
+ 		      NULL,
+ 		      peer_dbus_connect,
+-		      0),
++		      SD_BUS_VTABLE_UNPRIVILEGED),
+ 	SD_BUS_METHOD("Disconnect",
+ 		      NULL,
+ 		      NULL,
+ 		      peer_dbus_disconnect,
+-		      0),
++		      SD_BUS_VTABLE_UNPRIVILEGED),
+ 	SD_BUS_PROPERTY("Link",
+ 			"o",
+ 			peer_dbus_get_link,
+@@ -697,25 +698,29 @@
+ 				 link_dbus_get_friendly_name,
+ 				 link_dbus_set_friendly_name,
+ 				 0,
+-				 SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
++				 SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE |
++				 SD_BUS_VTABLE_UNPRIVILEGED),
+ 	SD_BUS_WRITABLE_PROPERTY("Managed",
+ 				 "b",
+ 				 link_dbus_get_managed,
+ 				 link_dbus_set_managed,
+ 				 0,
+-				 SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
++				 SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE |
++				 SD_BUS_VTABLE_UNPRIVILEGED),
+ 	SD_BUS_WRITABLE_PROPERTY("P2PScanning",
+ 				 "b",
+ 				 link_dbus_get_p2p_scanning,
+ 				 link_dbus_set_p2p_scanning,
+ 				 0,
+-				 SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
++				 SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE |
++				 SD_BUS_VTABLE_UNPRIVILEGED),
+ 	SD_BUS_WRITABLE_PROPERTY("WfdSubelements",
+ 				 "s",
+ 				 link_dbus_get_wfd_subelements,
+ 				 link_dbus_set_wfd_subelements,
+ 				 0,
+-				 SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
++				 SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE |
++				 SD_BUS_VTABLE_UNPRIVILEGED),
+ 	SD_BUS_VTABLE_END
+ };
+ 
+--- miraclecast.orig/src/wifi/wifid-supplicant.c
++++ miraclecast/src/wifi/wifid-supplicant.c
+@@ -71,6 +71,8 @@
+ 	char *prov;
+ 	char *pin;
+ 	char *sta_mac;
++
++	bool provisioning : 1;
+ };
+ 
+ struct supplicant {
+@@ -99,6 +101,8 @@
+ 	bool has_p2p : 1;
+ 	bool has_wfd : 1;
+ 	bool p2p_scanning : 1;
++	bool scan_requested : 1;
++	bool external : 1;
+ };
+ 
+ /* Device Password ID */
+@@ -114,6 +118,7 @@
+ 
+ static void supplicant_failed(struct supplicant *s);
+ static void supplicant_peer_drop_group(struct supplicant_peer *sp);
++static void supplicant_peer_detach_group(struct supplicant_peer *sp);
+ 
+ static struct supplicant_peer *find_peer_by_p2p_mac(struct supplicant *s,
+ 						    const char *p2p_mac)
+@@ -219,7 +224,7 @@
+ 
+ 	LINK_FOREACH_PEER(p, g->s->l)
+ 		if (p->sp->g == g)
+-			supplicant_peer_drop_group(p->sp);
++			supplicant_peer_detach_group(p->sp);
+ 
+ 	shl_dlist_unlink(&g->list);
+ 
+@@ -318,13 +323,18 @@
+ 	if (g->local_addr) {
+ 		if (g->sp) {
+ 			p = g->sp->p;
+-			if (p->sp->remote_addr)
++			if (p->sp->remote_addr) {
++				if (g->s->pending == p->sp)
++					g->s->pending = NULL;
+ 				peer_supplicant_connected_changed(p, true);
++			}
+ 		} else {
+ 			LINK_FOREACH_PEER(p, g->s->l) {
+ 				if (p->sp->g != g || !p->sp->remote_addr)
+ 					continue;
+ 
++				if (g->s->pending == p->sp)
++					g->s->pending = NULL;
+ 				peer_supplicant_connected_changed(p, true);
+ 			}
+ 		}
+@@ -410,6 +420,10 @@
+ 			argv[i++] = "--ip-binary";
+ 			argv[i++] = g->s->l->ip_binary;
+ 		}
++		if (arg_route_table) {
++			argv[i++] = "--route-table";
++			argv[i++] = (char*)arg_route_table;
++		}
+ 		argv[i] = NULL;
+ 
+ 		if (execvpe(argv[0], argv, environ)< 0) {
+@@ -425,7 +439,10 @@
+ 	return 0;
+ }
+ 
+-static int supplicant_group_spawn_dhcp_client(struct supplicant_group *g)
++static int supplicant_group_spawn_dhcp_client(struct supplicant_group *g,
++					      const char *local_addr,
++					      const char *subnet_mask,
++					      const char *gateway)
+ {
+ 	char *argv[64], loglevel[64], commfd[64];
+ 	char journal_id[128];
+@@ -479,6 +496,18 @@
+ 			argv[i++] = "--ip-binary";
+ 			argv[i++] = g->s->l->ip_binary;
+ 		}
++		if (local_addr && subnet_mask && gateway) {
++			argv[i++] = "--static-address";
++			argv[i++] = (char*)local_addr;
++			argv[i++] = "--static-subnet";
++			argv[i++] = (char*)subnet_mask;
++			argv[i++] = "--static-gateway";
++			argv[i++] = (char*)gateway;
++		}
++		if (arg_route_table) {
++			argv[i++] = "--route-table";
++			argv[i++] = (char*)arg_route_table;
++		}
+ 		argv[i] = NULL;
+ 
+ 		if (execvpe(argv[0], argv, environ) < 0) {
+@@ -497,7 +526,10 @@
+ static int supplicant_group_new(struct supplicant *s,
+ 				struct supplicant_group **out,
+ 				const char *ifname,
+-				bool go)
++				bool go,
++				const char *local_addr,
++				const char *subnet_mask,
++				const char *gateway)
+ {
+ 	struct supplicant_group *g, *j;
+ 	struct shl_dlist *i;
+@@ -547,7 +579,10 @@
+ 			r = -EINVAL;
+ 		}
+ 	} else {
+-		r = supplicant_group_spawn_dhcp_client(g);
++		r = supplicant_group_spawn_dhcp_client(g,
++						       local_addr,
++						       subnet_mask,
++						       gateway);
+ 	}
+ 	if (r < 0)
+ 		goto error;
+@@ -625,15 +660,14 @@
+ 	supplicant_group_keep(g);
+ }
+ 
+-static void supplicant_peer_drop_group(struct supplicant_peer *sp)
++static void supplicant_peer_detach_group(struct supplicant_peer *sp)
+ {
+ 	if (!sp->g)
+ 		return;
+ 
+ 	if (sp->g->sp == sp)
+-		sp->g = NULL;
++		sp->g->sp = NULL;
+ 
+-	supplicant_group_drop(sp->g);
+ 	sp->g = NULL;
+ 
+ 	free(sp->remote_addr);
+@@ -644,6 +678,59 @@
+ 	peer_supplicant_connected_changed(sp->p, false);
+ }
+ 
++static void supplicant_peer_drop_group(struct supplicant_peer *sp)
++{
++	struct supplicant_group *g;
++
++	if (!sp->g)
++		return;
++
++	g = sp->g;
++	supplicant_peer_detach_group(sp);
++	supplicant_group_drop(g);
++}
++
++static int supplicant_p2p_cancel_fn(struct wpas *w,
++				    struct wpas_message *reply,
++				    void *data)
++{
++	struct supplicant *s = data;
++
++	if (wpas_message_is_fail(reply))
++		log_warning("P2P_CANCEL failed");
++
++	/* P2P_FIND before the cancel reply races the queued P2P_CANCEL. */
++	if (s->running && s->has_p2p && s->scan_requested && !s->pending)
++		supplicant_p2p_start_scan(s);
++
++	return 0;
++}
++
++static void supplicant_p2p_cancel(struct supplicant *s)
++{
++	_wpas_message_unref_ struct wpas_message *m = NULL;
++	int r;
++
++	r = wpas_message_new_request(s->bus_global, "P2P_CANCEL", &m);
++	if (r < 0) {
++		log_vERR(r);
++		return;
++	}
++
++	r = wpas_call_async(s->bus_global,
++			    m,
++			    supplicant_p2p_cancel_fn,
++			    s,
++			    0,
++			    NULL);
++	if (r < 0) {
++		log_vERR(r);
++		return;
++	}
++
++	log_debug("sent P2P_CANCEL to wpas on %s", s->l->ifname);
++}
++
+ static int supplicant_peer_new(struct supplicant *s,
+ 			       const char *p2p_mac,
+ 			       struct supplicant_peer **out)
+@@ -676,13 +763,20 @@
+ 
+ static void supplicant_peer_free(struct supplicant_peer *sp)
+ {
++	bool cancel_provision;
++
+ 	if (!sp)
+ 		return;
+ 
++	cancel_provision = sp->provisioning && !sp->g;
++
+ 	if (sp->s->pending == sp) {
+ 		sp->s->pending = NULL;
++		cancel_provision = true;
+ 		peer_supplicant_formation_failure(sp->p, "lost");
+ 	}
++	if (cancel_provision)
++		supplicant_p2p_cancel(sp->s);
+ 
+ 	supplicant_peer_drop_group(sp);
+ 	peer_supplicant_stopped(sp->p);
+@@ -737,6 +831,27 @@
+ 	return sp->wfd_subelements;
+ }
+ 
++static int supplicant_p2p_connect_fn(struct wpas *w,
++				     struct wpas_message *reply,
++				     void *data)
++{
++	struct supplicant *s = data;
++	struct supplicant_peer *sp = s->pending;
++
++	if (!wpas_message_is_fail(reply))
++		return 0;
++
++	log_warning("P2P_CONNECT failed: %s", wpas_message_get_raw(reply));
++	if (sp) {
++		s->pending = NULL;
++		sp->provisioning = false;
++		supplicant_p2p_cancel(s);
++		peer_supplicant_formation_failure(sp->p, "connect rejected");
++	}
++
++	return 0;
++}
++
+ int supplicant_peer_connect(struct supplicant_peer *sp,
+ 			    const char *prov_type,
+ 			    const char *pin)
+@@ -749,8 +864,8 @@
+ 	if (sp->g)
+ 		return 0;
+ 
+-	if (sp->s->pending && sp->s->pending != sp)
+-		return log_ERR(-EALREADY);
++	if (sp->s->pending)
++		return sp->s->pending == sp ? 0 : log_ERR(-EALREADY);
+ 
+ 	if (!prov_type && !(prov_type = sp->prov))
+ 		prov_type = "pbc";
+@@ -798,10 +913,16 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	r = wpas_call_async(sp->s->bus_global, m, NULL, NULL, 0, NULL);
++	r = wpas_call_async(sp->s->bus_global,
++			    m,
++			    supplicant_p2p_connect_fn,
++			    sp->s,
++			    0,
++			    NULL);
+ 	if (r < 0)
+ 		return log_ERR(r);
+ 
++	sp->provisioning = false;
+ 	sp->s->pending = sp;
+ 
+ 	return 0;
+@@ -819,6 +940,15 @@
+ 	sp->pin = NULL;
+ 	free(sp->prov);
+ 	sp->prov = NULL;
++	sp->provisioning = false;
++
++	if (sp->s->pending == sp) {
++		sp->s->pending = NULL;
++		supplicant_p2p_cancel(sp->s);
++	} else if (!sp->s->pending && !sp->g) {
++		/* Provision discovery precedes P2P_CONNECT; reset must cancel untracked operations too. */
++		supplicant_p2p_cancel(sp->s);
++	}
+ 
+ 	supplicant_peer_drop_group(sp);
+ }
+@@ -847,6 +977,7 @@
+ {
+ 	struct supplicant_peer *sp;
+ 	const char *mac, *name, *val;
++	bool had_wfd;
+ 	char *t;
+ 	int r;
+ 
+@@ -864,6 +995,8 @@
+ 			return;
+ 	}
+ 
++	had_wfd = !shl_isempty(sp->wfd_subelements);
++
+ 	/* P2P-PEER reports the device name as 'device_name', P2P-DEVICE-FOUND
+ 	 * uses 'name. Allow either here.. */
+ 	r = wpas_message_dict_read(m, "device_name", 's', &name);
+@@ -914,6 +1047,11 @@
+ 
+ 	if (s->running)
+ 		peer_supplicant_started(sp->p);
++
++	/* Replay requests that arrived before WfdSubelements. */
++	if (!had_wfd && !shl_isempty(sp->wfd_subelements) &&
++	    sp->provisioning && sp->prov && !sp->g)
++		peer_supplicant_provision_discovery(sp->p, sp->prov, sp->pin);
+ }
+ 
+ static void supplicant_event_p2p_find_stopped(struct supplicant *s,
+@@ -1043,9 +1181,44 @@
+ 	free(sp->pin);
+ 	sp->pin = NULL;
+ 
++	sp->provisioning = true;
+ 	peer_supplicant_provision_discovery(sp->p, sp->prov, sp->pin);
+ }
+ 
++static void supplicant_event_p2p_prov_disc_failure(struct supplicant *s,
++						   struct wpas_message *ev)
++{
++	struct supplicant_peer *sp;
++	const char *mac;
++	int r;
++
++	r = wpas_message_dict_read(ev, "p2p_dev_addr", 's', &mac);
++	if (r < 0) {
++		log_debug("no p2p_dev_addr in P2P-PROV-DISC-FAILURE: %s",
++			  wpas_message_get_raw(ev));
++		return;
++	}
++
++	sp = find_peer_by_p2p_mac(s, mac);
++	if (!sp || (!sp->prov && s->pending != sp)) {
++		log_debug("stale P2P-PROV-DISC-FAILURE: %s",
++			  wpas_message_get_raw(ev));
++		return;
++	}
++
++	free(sp->pin);
++	sp->pin = NULL;
++	free(sp->prov);
++	sp->prov = NULL;
++	sp->provisioning = false;
++
++	if (s->pending == sp)
++		s->pending = NULL;
++
++	supplicant_p2p_cancel(s);
++	peer_supplicant_formation_failure(sp->p, "provision discovery failed");
++}
++
+ static void supplicant_event_p2p_go_neg_request(struct supplicant *s,
+ 					       struct wpas_message *ev)
+ {
+@@ -1135,6 +1308,7 @@
+ 	free(sp->pin);
+ 	sp->pin = u;
+ 
++	sp->provisioning = true;
+ 	peer_supplicant_provision_discovery(sp->p, sp->prov, sp->pin);
+ }
+ 
+@@ -1169,6 +1343,7 @@
+ 	free(sp->pin);
+ 	sp->pin = NULL;
+ 
++	sp->provisioning = true;
+ 	peer_supplicant_provision_discovery(sp->p, sp->prov, sp->pin);
+ }
+ 
+@@ -1226,6 +1401,7 @@
+ 	struct supplicant_peer *sp;
+ 	struct supplicant_group *g;
+ 	const char *mac, *ssid, *ifname, *go;
++	const char *local_addr = NULL, *subnet_mask = NULL, *gateway = NULL;
+ 	bool is_go;
+ 	int r;
+ 
+@@ -1257,6 +1433,18 @@
+ 
+ 	is_go = !strcmp(go, "GO");
+ 
++	if (!is_go &&
++	    wpas_message_dict_read(ev, "ip_addr", 's', &local_addr) >= 0 &&
++	    wpas_message_dict_read(ev, "ip_mask", 's', &subnet_mask) >= 0 &&
++	    wpas_message_dict_read(ev, "go_ip_addr", 's', &gateway) >= 0) {
++		log_debug("using addressing from P2P-GROUP-STARTED: %s/%s via %s",
++			  local_addr, subnet_mask, gateway);
++	} else {
++		local_addr = NULL;
++		subnet_mask = NULL;
++		gateway = NULL;
++	}
++
+ 	sp = find_peer_by_p2p_mac(s, mac);
+ 	if (!sp) {
+ 		if (!s->p2p_mac || strcmp(s->p2p_mac, mac)) {
+@@ -1268,7 +1456,13 @@
+ 
+ 	g = find_group_by_ifname(s, ifname);
+ 	if (!g) {
+-		r = supplicant_group_new(s, &g, ifname, is_go);
++		r = supplicant_group_new(s,
++					 &g,
++					 ifname,
++					 is_go,
++					 local_addr,
++					 subnet_mask,
++					 gateway);
+ 		if (r < 0)
+ 			return;
+ 
+@@ -1280,6 +1474,7 @@
+ 	}
+ 
+ 	if (sp) {
++		sp->provisioning = false;
+ 		supplicant_peer_set_group(sp, g);
+ 		g->sp = sp;
+ 	}
+@@ -1288,10 +1483,13 @@
+ 	 * group gets removed in case the remote side never connects. */
+ }
+ 
++static void supplicant_resume_requested_scan(struct supplicant *s);
++
+ static void supplicant_event_p2p_group_removed(struct supplicant *s,
+ 					       struct wpas_message *ev)
+ {
+ 	struct supplicant_group *g;
++	struct peer *p, *failed = NULL;
+ 	const char *ifname;
+ 	int r;
+ 
+@@ -1306,11 +1504,34 @@
+ 	if (!g) {
+ 		log_debug("stray P2P-GROUP-REMOVED: %s",
+ 			  wpas_message_get_raw(ev));
++		supplicant_resume_requested_scan(s);
+ 		return;
+ 	}
+ 
+ 	log_debug("remove group %s", ifname);
++
++	LINK_FOREACH_PEER(p, s->l) {
++		if (p->sp->g == g && s->pending == p->sp) {
++			s->pending = NULL;
++			failed = p;
++			break;
++		}
++	}
++
+ 	supplicant_group_free(g);
++
++	if (failed)
++		peer_supplicant_formation_failure(failed, "group removed");
++}
++
++/* Failed peer-initiated formation leaves wpas undiscoverable. */
++static void supplicant_resume_requested_scan(struct supplicant *s)
++{
++	if (!s->scan_requested || s->p2p_scanning)
++		return;
++
++	log_debug("resuming p2p scan after failed group formation");
++	supplicant_p2p_start_scan(s);
+ }
+ 
+ static void supplicant_event_p2p_go_neg_failure(struct supplicant *s,
+@@ -1323,7 +1544,10 @@
+ 			  s->pending->friendly_name);
+ 		p = s->pending->p;
+ 		s->pending = NULL;
++		supplicant_p2p_cancel(s);
+ 		peer_supplicant_formation_failure(p, "group owner negotiation failed");
++	} else {
++		supplicant_resume_requested_scan(s);
+ 	}
+ }
+ 
+@@ -1340,7 +1564,10 @@
+ 			  s->pending->friendly_name);
+ 		p = s->pending->p;
+ 		s->pending = NULL;
++		supplicant_p2p_cancel(s);
+ 		peer_supplicant_formation_failure(p, "unknown");
++	} else {
++		supplicant_resume_requested_scan(s);
+ 	}
+ }
+ 
+@@ -1407,6 +1634,7 @@
+ 	}
+ 
+ 	log_debug("bind peer %s to existing local group %s", p2p_mac, ifname);
++	sp->provisioning = false;
+ 	supplicant_peer_set_group(sp, g);
+ }
+ 
+@@ -1486,6 +1714,12 @@
+ 		    !strcmp(name, "Associated"))
+ 			return;
+ 
++		/* Datagram sockets provide no HUP when the daemon dies. */
++		if (!strcmp(name, "CTRL-EVENT-TERMINATING")) {
++			supplicant_failed(s);
++			return;
++		}
++
+ 		if (!strcmp(name, "P2P-FIND-STOPPED"))
+ 			supplicant_event_p2p_find_stopped(s, m);
+ 		else if (!strcmp(name, "P2P-DEVICE-FOUND"))
+@@ -1494,6 +1728,8 @@
+ 			supplicant_event_p2p_device_lost(s, m);
+ 		else if (!strcmp(name, "P2P-PROV-DISC-PBC-REQ"))
+ 			supplicant_event_p2p_prov_disc_pbc_req(s, m);
++		else if (!strcmp(name, "P2P-PROV-DISC-FAILURE"))
++			supplicant_event_p2p_prov_disc_failure(s, m);
+ 		else if (!strcmp(name, "P2P-PROV-DISC-SHOW-PIN"))
+ 			supplicant_event_p2p_prov_disc_show_pin(s, m);
+ 		else if (!strcmp(name, "P2P-PROV-DISC-ENTER-PIN"))
+@@ -1542,22 +1778,8 @@
+ 
+ 	LINK_FOREACH_PEER(p, s->l)
+ 		peer_supplicant_started(p);
+-}
+-
+-static int supplicant_p2p_set_disallow_freq_fn(struct wpas *w,
+-					       struct wpas_message *reply,
+-					       void *data)
+-{
+-	struct supplicant *s = data;
+-
+-	/* P2P_SET disallow_freq received */
+-	--s->setup_cnt;
+-
+-	if (!wpas_message_is_ok(reply))
+-		log_warning("cannot set p2p disallow_freq field");
+-
+-	supplicant_try_ready(s);
+-	return 0;
++	if (s->scan_requested && s->has_p2p)
++		supplicant_p2p_start_scan(s);
+ }
+ 
+ static int supplicant_init_p2p_peer_fn(struct wpas *w,
+@@ -1748,34 +1970,6 @@
+ 			goto error;
+ 		}
+ 
+-		/* require P2P_SET disallow_freq response */
+-		++s->setup_cnt;
+-
+-		r = wpas_message_new_request(s->bus_global,
+-					     "P2P_SET",
+-					     &m);
+-		if (r < 0) {
+-			log_vERR(r);
+-			goto error;
+-		}
+-
+-		r = wpas_message_append(m, "ss", "disallow_freq", "5180-5900");
+-		if (r < 0) {
+-			log_vERR(r);
+-			goto error;
+-		}
+-
+-		r = wpas_call_async(s->bus_global,
+-				    m,
+-				    supplicant_p2p_set_disallow_freq_fn,
+-				    s,
+-				    0,
+-				    NULL);
+-		if (r < 0) {
+-			log_vERR(r);
+-			goto error;
+-		}
+-
+ 		/* require P2P_PEER listing */
+ 		++s->setup_cnt;
+ 
+@@ -2018,10 +2212,18 @@
+ 	_wpas_message_unref_ struct wpas_message *m = NULL;
+ 	int r;
+ 
+-	if (!s->running || !s->has_p2p)
+-		return log_EINVAL();
++	s->scan_requested = true;
+ 
+-	s->pending = NULL;
++	if (!s->running)
++		return 0;
++	if (!s->has_p2p)
++		return -EOPNOTSUPP;
++
++	if (s->pending) {
++		s->pending = NULL;
++		supplicant_p2p_cancel(s);
++		return 0;
++	}
+ 
+ 	/*
+ 	 * This call is asynchronous. You can safely issue multiple of these
+@@ -2063,8 +2265,12 @@
+ 	_wpas_message_unref_ struct wpas_message *m = NULL;
+ 	int r;
+ 
+-	if (!s->running || !s->has_p2p)
+-		return log_vEINVAL();
++	s->scan_requested = false;
++
++	if (!s->running)
++		return;
++	if (!s->has_p2p)
++		return log_vERR(-EOPNOTSUPP);
+ 
+ 	/*
+ 	 * Always send the P2P_STOP_FIND message even if we think we're not
+@@ -2347,12 +2553,11 @@
+ 
+ 	if (shl_ratelimit_test(&s->restart_rate)) {
+ 		ms = 200ULL;
+-		log_error("wpas (pid:%d) failed unexpectedly, relaunching after short grace period..",
+-			  (int)s->pid);
++		log_error("wpas connection failed, reconnecting after short grace period..");
+ 	} else {
+ 		ms = 30 * 1000ULL;
+-		log_error("wpas (pid:%d) failed again.. entering grace period, waiting %llus before relaunching",
+-			  (int)s->pid, (unsigned long long)ms / 1000ULL);
++		log_error("wpas connection failed again; waiting %llus before reconnecting",
++			  (unsigned long long)ms / 1000ULL);
+ 	}
+ 
+ 	ms *= 1000;
+@@ -2362,7 +2567,7 @@
+ 
+ 	/* Always send SIGTERM, even if already dead the child is still not
+ 	 * reaped so we can still send signals. */
+-	if (s->pid > 0) {
++	if (!s->external && s->pid > 0) {
+ 		log_debug("terminating wpas (pid:%d)", (int)s->pid);
+ 		r = kill(s->pid, SIGTERM);
+ 		if (r < 0)
+@@ -2552,7 +2757,7 @@
+ 	uint64_t ms;
+ 	int r;
+ 
+-	if (!s->pid) {
++	if (!s->pid && !s->external) {
+ 		r = supplicant_spawn(s);
+ 		if (r < 0) {
+ 			/* We cannot *spawn* wpas, we might have hit a
+@@ -2582,7 +2787,7 @@
+ 			sd_event_source_set_time(source, ms);
+ 			sd_event_source_set_enabled(source, SD_EVENT_ON);
+ 		}
+-	} else if (s->pid > 0 && !s->running) {
++	} else if ((s->pid > 0 || s->external) && !s->running) {
+ 		r = supplicant_open(s);
+ 		if (r < 0) {
+ 			/* Cannot connect to supplicant, retry in 200ms
+@@ -2629,6 +2834,7 @@
+ 		    "config_methods=%s\n"
+ 		    "driver_param=%s\n"
+ 		    "ap_scan=%s\n"
++		    "persistent_reconnect=1\n"
+ 		    "# End of configuration\n",
+ 		    s->l->friendly_name ?: "unknown",
+ 		    "1-0050F204-1",
+@@ -2651,6 +2857,7 @@
+ 
+ int supplicant_start(struct supplicant *s)
+ {
++	const char *external_ctrl;
+ 	int r;
+ 
+ 	if (!s)
+@@ -2662,24 +2869,34 @@
+ 
+ 	SHL_RATELIMIT_RESET(s->restart_rate);
+ 	SHL_RATELIMIT_RESET(s->exec_rate);
++	external_ctrl = getenv("MIRACLECAST_WPA_CONTROL");
++	s->external = external_ctrl && *external_ctrl;
+ 
+-	r = asprintf(&s->global_ctrl, "/run/miracle/wifi/%s-%u.global",
+-		     s->l->ifname, s->l->ifindex);
++	if (s->external) {
++		s->global_ctrl = strdup(external_ctrl);
++		r = s->global_ctrl ? 0 : -ENOMEM;
++	} else {
++		r = asprintf(&s->global_ctrl, "/run/miracle/wifi/%s-%u.global",
++			     s->l->ifname, s->l->ifindex);
++	}
+ 	if (r < 0) {
+ 		r = log_ENOMEM();
+ 		goto error;
+ 	}
+ 
+-	r = asprintf(&s->dev_ctrl, "/run/miracle/wifi/p2p-dev-%s",
++	r = asprintf(&s->dev_ctrl, "%s/p2p-dev-%s",
++		     s->external ? "/run/wpa_supplicant" : "/run/miracle/wifi",
+ 		     s->l->ifname);
+ 	if (r < 0) {
+ 		r = log_ENOMEM();
+ 		goto error;
+ 	}
+ 
+-	r = supplicant_write_config(s);
+-	if (r < 0)
+-		goto error;
++	if (!s->external) {
++		r = supplicant_write_config(s);
++		if (r < 0)
++			goto error;
++	}
+ 
+ 	/* add initial 200ms startup timer */
+ 	r = sd_event_add_time(s->l->m->event,
+@@ -2694,9 +2911,14 @@
+ 		goto error;
+ 	}
+ 
+-	r = supplicant_spawn(s);
+-	if (r < 0)
+-		goto error;
++	/* An external supplicant has no PID; zero marks pending reconnection. */
++	if (s->external)
++		s->pid = 0;
++	else {
++		r = supplicant_spawn(s);
++		if (r < 0)
++			goto error;
++	}
+ 
+ 	return 0;
+ 
+@@ -2721,7 +2943,7 @@
+ 	sd_event_source_unref(s->timer_source);
+ 	s->timer_source = NULL;
+ 
+-	if (s->pid > 0) {
++	if (!s->external && s->pid > 0) {
+ 		r = kill(s->pid, SIGTERM);
+ 		if (r < 0)
+ 			r = kill(s->pid, SIGKILL);
+@@ -2742,6 +2964,7 @@
+ 	s->dev_ctrl = NULL;
+ 
+ 	s->pid = -1;
++	s->external = false;
+ 	supplicant_stopped(s);
+ }
+ 
+@@ -2753,8 +2976,9 @@
+ 	}
+ 
+ 	/* pid > 0 means supplicant-process is known, pid == 0 means we are
+-	 * currently in a grace period to restart it. pid < 0 means we are
+-	 * not managing any wpas instance. */
++	 * currently in a grace period to restart it (or reconnecting to an
++	 * external supplicant). pid < 0 means we are not managing any wpas
++	 * instance. */
+ 
+ 	return s->pid >= 0;
+ }
+--- miraclecast.orig/src/wifi/wifid.c
++++ miraclecast/src/wifi/wifid.c
+@@ -20,6 +20,7 @@
+ #include <errno.h>
+ #include <getopt.h>
+ #include <libudev.h>
++#include <net/if.h>
+ #include <signal.h>
+ #include <stdbool.h>
+ #include <stdio.h>
+@@ -44,11 +45,13 @@
+ #define STR(x) #x
+ const char *interface_name = NULL;
+ const char *config_methods = NULL;
++const char *arg_friendly_name = NULL;
+ unsigned int arg_wpa_loglevel = LOG_NOTICE;
+ bool arg_wpa_syslog = false;
+ bool use_dev = false;
+ bool lazy_managed = false;
+ const char *arg_ip_binary = NULL;
++const char *arg_route_table = NULL;
+ 
+ 
+ /*
+@@ -80,22 +83,14 @@
+ 	return manager_find_link(m, idx);
+ }
+ 
+-static void manager_add_udev_link(struct manager *m,
+-				  struct udev_device *d)
++static void manager_add_link(struct manager *m,
++			     unsigned int ifindex,
++			     const char *ifname,
++			     bool managed)
+ {
+ 	struct link *l;
+-	unsigned int ifindex;
+-	const char *ifname;
+ 	int r;
+ 
+-	ifindex = ifindex_from_udev_device(d);
+-	if (!ifindex)
+-		return;
+-
+-	ifname = udev_device_get_property_value(d, "INTERFACE");
+-	if (!ifname)
+-		return;
+-
+ 	if (interface_name && strcmp(interface_name, ifname)) {
+ 		return;
+ 	}
+@@ -108,7 +103,7 @@
+ 	if (r < 0)
+ 		return;
+ 
+-	if (m->friendly_name && l->managed)
++	if (m->friendly_name)
+ 		link_set_friendly_name(l, m->friendly_name);
+ 	if (m->config_methods)
+ 		link_set_config_methods(l, m->config_methods);
+@@ -118,18 +113,36 @@
+ 	if(arg_ip_binary)
+ 		link_set_ip_binary(l, arg_ip_binary);
+ 
+-#ifdef RELY_UDEV
+-	bool managed = udev_device_has_tag(d, "miracle") && !lazy_managed;
+-#else
+-	bool managed = (!interface_name || !strcmp(interface_name, ifname)) && !lazy_managed;
+-#endif
+-	if (managed) {
++	if (managed && !lazy_managed) {
+ 		link_set_managed(l, true);
+ 	} else {
+ 		log_debug("ignored device: %s", ifname);
+ 	}
+ }
+ 
++static void manager_add_udev_link(struct manager *m,
++				  struct udev_device *d)
++{
++	unsigned int ifindex;
++	const char *ifname;
++	bool managed;
++
++	ifindex = ifindex_from_udev_device(d);
++	if (!ifindex)
++		return;
++
++	ifname = udev_device_get_property_value(d, "INTERFACE");
++	if (!ifname)
++		return;
++
++#ifdef RELY_UDEV
++	managed = udev_device_has_tag(d, "miracle");
++#else
++	managed = !interface_name || !strcmp(interface_name, ifname);
++#endif
++	manager_add_link(m, ifindex, ifname, managed);
++}
++
+ static int manager_udev_fn(sd_event_source *source,
+ 			   int fd,
+ 			   uint32_t mask,
+@@ -249,6 +262,11 @@
+ 
+ 	shl_htable_init_uint(&m->links);
+ 
++	if (arg_friendly_name) {
++		m->friendly_name = strdup(arg_friendly_name);
++		if (!m->friendly_name)
++			return log_ENOMEM();
++	}
+ 
+ 	if (config_methods) {
+ 		cm = strdup(config_methods);
+@@ -277,6 +295,9 @@
+ 		goto error;
+ 	}
+ 
++	/* sd-bus never reconnects; restart on a fresh bus. */
++	sd_bus_set_exit_on_disconnect(m->bus, true);
++
+ 	r = sd_bus_attach_event(m->bus, m->event, 0);
+ 	if (r < 0) {
+ 		log_vERR(r);
+@@ -406,8 +427,21 @@
+ 	_cleanup_udev_enumerate_ struct udev_enumerate *e = NULL;
+ 	struct udev_list_entry *l;
+ 	struct udev_device *d;
++	unsigned int ifindex;
+ 	int r;
+ 
++	/* Host udev cannot enumerate interfaces moved into a netns. */
++	if (interface_name) {
++		ifindex = if_nametoindex(interface_name);
++		if (!ifindex) {
++			log_warning("cannot find interface %s", interface_name);
++			return;
++		}
++
++		manager_add_link(m, ifindex, interface_name, true);
++		return;
++	}
++
+ 	e = udev_enumerate_new(m->udev);
+ 	if (!e)
+ 		goto error;
+@@ -459,7 +493,8 @@
+ 		return r;
+ 	}
+ 
+-	manager_read_name(m);
++	if (!m->friendly_name)
++		manager_read_name(m);
+ 	manager_read_links(m);
+ 
+ 	return 0;
+@@ -485,6 +520,7 @@
+ 	       "     --log-date-time       Prefix log-messages with date time\n"
+ 	       "\n"
+ 	       "  -i --interface           Choose the interface to use\n"
++	       "  -n --friendly-name       Set the advertised device name\n"
+ 	       "     --config-methods      Define config methods for pairing, default 'pbc'\n"
+ 	       "\n"
+ 	       "     --wpa-loglevel <lvl>  wpa_supplicant log-level\n"
+@@ -492,6 +528,7 @@
+ 	       "     --use-dev             enable workaround for 'no ifname' issue\n"
+ 	       "     --lazy-managed        manage interface only when user decide to do\n"
+ 	       "     --ip-binary <path>    path to 'ip' binary [default: "XSTR(IP_BINARY)"]\n"
++	       "     --route-table <id>    install P2P routes in this table\n"
+ 	       , program_invocation_short_name);
+ 	/*
+ 	 * 80-char barrier:
+@@ -514,6 +551,7 @@
+ 		ARG_CONFIG_METHODS,
+ 		ARG_LAZY_MANAGED,
+ 		ARG_IP_BINARY,
++		ARG_ROUTE_TABLE,
+ 	};
+ 	static const struct option options[] = {
+ 		{ "help",       	no_argument,		NULL,	'h' },
+@@ -525,21 +563,26 @@
+ 		{ "wpa-loglevel",	required_argument,	NULL,	ARG_WPA_LOGLEVEL },
+ 		{ "wpa-syslog",	no_argument,	NULL,	ARG_WPA_SYSLOG },
+ 		{ "interface",	required_argument,	NULL,	'i' },
++		{ "friendly-name", required_argument,	NULL,	'n' },
+ 		{ "use-dev",	no_argument,	NULL,	ARG_USE_DEV },
+ 		{ "config-methods",	required_argument,	NULL,	ARG_CONFIG_METHODS },
+ 		{ "lazy-managed",	no_argument,	NULL,	ARG_LAZY_MANAGED },
+ 		{ "ip-binary",	required_argument,	NULL,	ARG_IP_BINARY },
++		{ "route-table", required_argument,	NULL,	ARG_ROUTE_TABLE },
+ 		{}
+ 	};
+ 	int c;
+ 
+-	while ((c = getopt_long(argc, argv, "hi:", options, NULL)) >= 0) {
++	while ((c = getopt_long(argc, argv, "hi:n:", options, NULL)) >= 0) {
+ 		switch (c) {
+ 		case 'h':
+ 			return help();
+ 		case 'i':
+ 			interface_name = optarg;
+ 			break;
++		case 'n':
++			arg_friendly_name = optarg;
++			break;
+ 		case ARG_VERSION:
+ 			puts(PACKAGE_STRING);
+ 			return 0;
+@@ -570,6 +613,9 @@
+ 		case ARG_IP_BINARY:
+ 			arg_ip_binary = optarg;
+ 			break;
++		case ARG_ROUTE_TABLE:
++			arg_route_table = optarg;
++			break;
+ 		case '?':
+ 			return -EINVAL;
+ 		}
+--- miraclecast.orig/src/wifi/wifid.h
++++ miraclecast/src/wifi/wifid.h
+@@ -217,5 +217,6 @@
+ 
+ extern unsigned int arg_wpa_loglevel;
+ extern bool arg_wpa_syslog;
++extern const char *arg_route_table;
+ 
+ #endif /* WIFID_H */

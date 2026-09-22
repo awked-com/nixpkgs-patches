@@ -1,0 +1,18 @@
+Reject HTTP HLS requests when HLS support is disabled.
+
+A client-supplied CSeq header must not bypass the HLS gate and expose the
+HTTP control handlers. Keep RTSP mirroring and BLE discovery unchanged.
+
+--- uxplay.orig/lib/raop.c
++++ uxplay/lib/raop.c
+@@ -258,7 +258,9 @@
+     }
+ 
+  /* this rejects messages from _airplay._tcp for video streaming protocol unless bool raop->hls_support is true*/   
+-    if (!cseq && !raop->hls_support && !ble) {
++    /* A CSeq header must not enable disabled HTTP HLS handlers. */
++    if (!raop->hls_support &&
++        ((!cseq && !ble) || !strcmp(protocol, "HTTP/1.1"))) {
+         logger_log(raop->logger, LOGGER_INFO, "ignoring AirPlay video streaming request (use option -hls to activate HLS support)");
+         return;
+     }

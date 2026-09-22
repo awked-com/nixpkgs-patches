@@ -1,0 +1,159 @@
+--- rauthy.orig/frontend/svelte.config.js
++++ rauthy/frontend/svelte.config.js
+@@ -6,6 +6,11 @@
+         runes: true,
+     },
+     kit: {
++        // Supplied from the source and patches, identical for every cluster node.
++        // SvelteKit's default build timestamp changes the content-hashed asset URLs.
++        version: {
++            name: '@rauthyUiVersion@',
++        },
+         // CAUTION: The order of the arguments here is important - paths must come before adapter
+         paths: {
+             base: '/auth/v1',
+--- rauthy.orig/frontend/vite.config.js
++++ rauthy/frontend/vite.config.js
+@@ -1,5 +1,6 @@
+ import { sveltekit } from '@sveltejs/kit/vite';
+ import wasm from 'vite-plugin-wasm';
++import svelteConfig from './svelte.config.js';
+ // import fs from 'fs';
+ 
+ const backend = 'http://127.0.0.1:8080';
+@@ -71,7 +72,28 @@
+     },
+     worker: {
+         format: 'es',
+-        plugins: () => [wasm()],
++        plugins: () => [
++            wasm(),
++            {
++                name: 'versioned-wasm-assets',
++                outputOptions(options) {
++                    // Native WASM toolchains can emit different bytes for the same source.
++                    // Keep worker URLs identical across cluster nodes, but bust caches
++                    // when the source or patches change. JS and CSS retain content hashes.
++                    const pattern = options.assetFileNames;
++                    return {
++                        ...options,
++                        assetFileNames: asset =>
++                            asset.names.some(name => name.endsWith('.wasm'))
++                                ? pattern.replace(
++                                      '[hash]',
++                                      svelteConfig.kit.version.name,
++                                  )
++                                : pattern,
++                    };
++                },
++            },
++        ],
+     },
+ };
+ 
+--- /dev/null
++++ rauthy/frontend/tests/worker-assets.check.js
+@@ -0,0 +1,103 @@
++import assert from 'node:assert/strict';
++import { mkdtemp, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { test } from 'node:test';
++import { build } from 'vite';
++import config from '../vite.config.js';
++import svelteConfig from '../svelte.config.js';
++
++test('worker WASM URLs follow the UI version instead of native build bytes', async () => {
++    const root = await mkdtemp(join(tmpdir(), 'rauthy-worker-assets-'));
++    const version = svelteConfig.kit.version.name;
++    try {
++        await writeFile(
++            join(root, 'index.html'),
++            '<script type="module" src="/main.js"></script>',
++        );
++        await writeFile(
++            join(root, 'main.js'),
++            'new Worker(new URL("./worker.js", import.meta.url), { type: "module" });',
++        );
++        await writeFile(
++            join(root, 'worker.js'),
++            'import("./module.js").then(({ url }) => postMessage(url));',
++        );
++        await writeFile(
++            join(root, 'module.js'),
++            'export { default as url } from "./md_bg.wasm?url";',
++        );
++
++        async function bundle(byte, patched = true) {
++            // Valid WASM modules differing only in a custom section.
++            await writeFile(
++                join(root, 'md_bg.wasm'),
++                new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 0, 2, 1, byte]),
++            );
++            const result = await build({
++                configFile: false,
++                root,
++                logLevel: 'silent',
++                build: { write: false, assetsInlineLimit: 0 },
++                worker: {
++                    ...config.worker,
++                    plugins: patched ? config.worker.plugins : () => [],
++                    rollupOptions: {
++                        output: {
++                            entryFileNames:
++                                '_app/immutable/workers/[name]-[hash].js',
++                            chunkFileNames:
++                                '_app/immutable/workers/chunks/[hash].js',
++                            assetFileNames:
++                                '_app/immutable/workers/assets/[name]-[hash][extname]',
++                        },
++                    },
++                },
++            });
++            return Object.fromEntries(
++                result.output.map(asset => [
++                    asset.fileName,
++                    asset.code ?? asset.source,
++                ]),
++            );
++        }
++
++        const unpatchedA = await bundle(97, false);
++        const unpatchedB = await bundle(98, false);
++        assert.notDeepEqual(
++            Object.keys(unpatchedA).sort(),
++            Object.keys(unpatchedB).sort(),
++        );
++
++        const patchedA = await bundle(97);
++        const patchedB = await bundle(98);
++        assert.deepEqual(
++            Object.keys(patchedA).sort(),
++            Object.keys(patchedB).sort(),
++        );
++        for (const name of Object.keys(patchedA)) {
++            if (!name.endsWith('.wasm'))
++                assert.deepEqual(patchedA[name], patchedB[name], name);
++        }
++        assert.ok(
++            Object.keys(patchedA).includes(
++                `_app/immutable/workers/assets/md_bg-${version}.wasm`,
++            ),
++        );
++        assert.ok(
++            Object.keys(patchedA).some(name =>
++                /workers\/worker-.+\.js$/.test(name),
++            ),
++        );
++
++        svelteConfig.kit.version.name = `${version}-updated`;
++        const updated = await bundle(97);
++        assert.notDeepEqual(
++            Object.keys(patchedA).sort(),
++            Object.keys(updated).sort(),
++        );
++    } finally {
++        svelteConfig.kit.version.name = version;
++        await rm(root, { recursive: true, force: true });
++    }
++});

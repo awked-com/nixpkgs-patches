@@ -1,0 +1,53 @@
+From d5c367b958be92d1927057e37223644b3ca317e9 Mon Sep 17 00:00:00 2001
+From: "Jason A. Donenfeld" <Jason@zx2c4.com>
+Date: Thu, 15 May 2025 16:48:14 +0200
+Subject: [PATCH 3/4] device: make unmarshall length checks exact
+
+This is already enforced in receive.go, but if these unmarshallers are
+to have error return values anyway, make them as explicit as possible.
+
+Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+(cherry picked from commit 842888ac5c93ccc5ee6344eceaadf783fcf1e243)
+---
+ device/noise-protocol.go | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+--- amneziawg-go.orig/device/noise-protocol.go
++++ amneziawg-go/device/noise-protocol.go
+@@ -119,11 +119,11 @@
+ 	Cookie   [blake2s.Size128 + poly1305.TagSize]byte
+ }
+ 
+-var errMessageTooShort = errors.New("message too short")
++var errMessageLengthMismatch = errors.New("message length mismatch")
+ 
+ func (msg *MessageInitiation) unmarshal(b []byte) error {
+-	if len(b) < MessageInitiationSize {
+-		return errMessageTooShort
++	if len(b) != MessageInitiationSize {
++		return errMessageLengthMismatch
+ 	}
+ 
+ 	msg.Type = binary.LittleEndian.Uint32(b)
+@@ -138,8 +138,8 @@
+ }
+ 
+ func (msg *MessageResponse) unmarshal(b []byte) error {
+-	if len(b) < MessageResponseSize {
+-		return errMessageTooShort
++	if len(b) != MessageResponseSize {
++		return errMessageLengthMismatch
+ 	}
+ 
+ 	msg.Type = binary.LittleEndian.Uint32(b)
+@@ -154,8 +154,8 @@
+ }
+ 
+ func (msg *MessageCookieReply) unmarshal(b []byte) error {
+-	if len(b) < MessageCookieReplySize {
+-		return errMessageTooShort
++	if len(b) != MessageCookieReplySize {
++		return errMessageLengthMismatch
+ 	}
+ 
+ 	msg.Type = binary.LittleEndian.Uint32(b)

@@ -1,0 +1,15 @@
+--- sonarr.orig/src/NzbDrone.Common/Http/Dispatchers/ManagedHttpDispatcher.cs
++++ sonarr/src/NzbDrone.Common/Http/Dispatchers/ManagedHttpDispatcher.cs
+@@ -277,6 +277,12 @@
+ 
+         private async ValueTask<Stream> onConnect(SocketsHttpConnectionContext context, CancellationToken cancellationToken)
+         {
++            // Literal addresses must not inherit a previous hostname's IPv6 failure.
++            if (IPAddress.TryParse(context.DnsEndPoint.Host.Trim('[', ']'), out var address))
++            {
++                return await attemptConnection(address.AddressFamily, context, cancellationToken);
++            }
++
+             // Until .NET supports an implementation of Happy Eyeballs (https://tools.ietf.org/html/rfc8305#section-2), let's make IPv4 fallback work in a simple way.
+             // This issue is being tracked at https://github.com/dotnet/runtime/issues/26177 and expected to be fixed in .NET 6.
+             if (useIPv6)

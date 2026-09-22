@@ -1,0 +1,21 @@
+--- btrbk.orig/btrbk
++++ btrbk/btrbk
+@@ -1593,8 +1593,16 @@
+           $send_receive_error = 1;
+         }
+         if((not $parent) && ($detail->{parent_uuid} ne '-')) {
+-          push @cmd_err, "parent_uuid is set on target: $vol_received->{PRINT}";
+-          $send_receive_error = 1;
++          # A confined receiver can publish a read-only snapshot of its staged
++          # receive. This sets parent_uuid even for a full send, but preserves
++          # received_uuid. Accept it only when that UUID identifies our stream.
++          # btrfs send uses received_uuid when forwarding a received subvolume.
++          my $stream_uuid = $snapshot->{node}{received_uuid};
++          $stream_uuid = $snapshot->{node}{uuid} if((not $stream_uuid) || ($stream_uuid eq '-'));
++          unless($stream_uuid && $detail->{received_uuid} && ($detail->{received_uuid} eq $stream_uuid)) {
++            push @cmd_err, "parent_uuid is set on target without matching received_uuid: $vol_received->{PRINT}";
++            $send_receive_error = 1;
++          }
+         }
+       }
+ 

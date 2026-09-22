@@ -1,0 +1,1300 @@
+--- miraclecast.orig/src/ctl/ctl-sink.c
++++ miraclecast/src/ctl/ctl-sink.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "ctl-sink.h"
++#include <stdint.h>
+ 
+ /*
+  * RTSP Session
+@@ -29,6 +30,47 @@
+ 	return 0;
+ }
+ 
++/* Windows sources may never repeat their initial SPS/PPS/IDR. */
++static int sink_request_idr(struct ctl_sink *s)
++{
++	_rtsp_message_unref_ struct rtsp_message *rep = NULL;
++	int r;
++
++	r = rtsp_message_new_request(s->rtsp,
++				     &rep,
++				     "SET_PARAMETER",
++				     s->url);
++	if (r < 0)
++		return r;
++
++	if (s->session) {
++		r = rtsp_message_append(rep, "<s>", "Session", s->session);
++		if (r < 0)
++			return r;
++	}
++
++	r = rtsp_message_append(rep, "{&}", "wfd_idr_request");
++	if (r < 0)
++		return r;
++
++	rtsp_message_seal(rep);
++	cli_debug("OUTGOING: %s\n", rtsp_message_get_raw(rep));
++
++	return rtsp_call_async(s->rtsp, rep, sink_req_fn, NULL, 0, NULL);
++}
++
++void ctl_sink_request_idr(struct ctl_sink *s)
++{
++	int r;
++
++	if (!s || !s->connected || !s->rtsp)
++		return;
++
++	r = sink_request_idr(s);
++	if (r < 0)
++		cli_vERR(r);
++}
++
+ static void sink_handle_options(struct ctl_sink *s,
+ 				struct rtsp_message *m)
+ {
+@@ -100,7 +142,11 @@
+     bool create_wfd_video_formats = wfd_video_formats == NULL;
+     if (create_wfd_video_formats) {
+         gchar video_formats[128];
+-        sprintf(video_formats, "00 00 03 10 %08x %08x %08x 00 0000 0000 10 none none",
++        /* A fixed native-mode byte would contradict the advertised masks. */
++        sprintf(video_formats, "%02x 00 03 10 %08x %08x %08x 00 0000 0000 10 none none",
++                vfd_get_native_index(s->resolutions_cea,
++                                     s->resolutions_vesa,
++                                     s->resolutions_hh),
+                 s->resolutions_cea, s->resolutions_vesa, s->resolutions_hh);
+         wfd_video_formats = strdup(video_formats);
+     }
+@@ -117,6 +163,8 @@
+             wfd_audio_codecs = wfd_audio_codecs_extension;
+         }
+     }
++    if (!wfd_audio_enabled)
++        wfd_audio_codecs = "none";
+     check_and_response_option(WFD_AUDIO_CODECS, wfd_audio_codecs);
+ 
+     /* wfd_client_rtp_ports */
+@@ -165,6 +213,74 @@
+ 	return rtsp_message_read(m, "{<>}", option) >= 0;
+ }
+ 
++static int sink_send_session_request(struct ctl_sink *s,
++				     const char *method,
++				     rtsp_callback_fn cb)
++{
++	_rtsp_message_unref_ struct rtsp_message *rep = NULL;
++	int r;
++
++	r = rtsp_message_new_request(s->rtsp,
++				     &rep,
++				     method,
++				     s->url ? : "*");
++	if (r < 0)
++		return r;
++
++	if (s->session) {
++		r = rtsp_message_append(rep, "<s>", "Session", s->session);
++		if (r < 0)
++			return r;
++	}
++
++	rtsp_message_seal(rep);
++	cli_debug("OUTGOING: %s\n", rtsp_message_get_raw(rep));
++
++	return rtsp_call_async(s->rtsp, rep, cb, s, 0, NULL);
++}
++
++static int sink_pause_fn(struct rtsp *bus,
++			 struct rtsp_message *m,
++			 void *data)
++{
++	struct ctl_sink *s = data;
++
++	if (m)
++		cli_debug("INCOMING: %s\n", rtsp_message_get_raw(m));
++
++	ctl_fn_sink_paused(s);
++	return 0;
++}
++
++static int sink_resume_fn(struct rtsp *bus,
++			  struct rtsp_message *m,
++			  void *data)
++{
++	struct ctl_sink *s = data;
++
++	if (m)
++		cli_debug("INCOMING: %s\n", rtsp_message_get_raw(m));
++
++	if (!s->session || !rtsp_message_is_reply(m, RTSP_CODE_OK, NULL))
++		return 0;
++
++	ctl_fn_sink_resumed(s);
++	return 0;
++}
++
++static int sink_teardown_fn(struct rtsp *bus,
++			    struct rtsp_message *m,
++			    void *data)
++{
++	struct ctl_sink *s = data;
++
++	s->hup = true;
++	ctl_sink_close(s);
++	ctl_fn_sink_disconnected(s);
++
++	return 0;
++}
++
+ static int sink_setup_fn(struct rtsp *bus, struct rtsp_message *m, void *data)
+ {
+ 	_rtsp_message_unref_ struct rtsp_message *rep = NULL;
+@@ -175,6 +291,9 @@
+ 
+ 	cli_debug("INCOMING: %s\n", rtsp_message_get_raw(m));
+ 
++	if (!rtsp_message_is_reply(m, RTSP_CODE_OK, NULL))
++		return 0;
++
+ 	r = rtsp_message_read(m, "<s>", "Session", &session);
+ 	if (r < 0)
+ 		return cli_ERR(r);
+@@ -186,6 +305,10 @@
+ 	next = strchr(ns, ';');
+ 	if (next)
+ 		*next = '\0';
++	if (!*ns) {
++		free(ns);
++		return cli_EINVAL();
++	}
+ 
+ 	free(s->session);
+ 	s->session = ns;
+@@ -204,7 +327,7 @@
+ 	rtsp_message_seal(rep);
+ 	cli_debug("OUTGOING: %s\n", rtsp_message_get_raw(rep));
+ 
+-	r = rtsp_call_async(s->rtsp, rep, sink_req_fn, NULL, 0, NULL);
++	r = rtsp_call_async(s->rtsp, rep, sink_resume_fn, s, 0, NULL);
+ 	if (r < 0)
+ 		return cli_ERR(r);
+ 
+@@ -324,11 +447,50 @@
+ 			return cli_vERR(r);
+ 	}
+ 
++	if (check_rtsp_option(m, "wfd_standby")) {
++		ctl_fn_sink_standby(s);
++		return;
++	}
++
+ 	/* M5 */
+ 	r = rtsp_message_read(m, "{<s>}", "wfd_trigger_method", &trigger);
+ 	if (r < 0)
+ 		return;
+ 
++	if (!strcmp(trigger, "TEARDOWN")) {
++		/* Closing now would discard the queued TEARDOWN reply. */
++		r = rtsp_message_new_request(s->rtsp,
++					     &rep,
++					     "TEARDOWN",
++					     s->url ? : "*");
++		if (r >= 0) {
++			rtsp_message_seal(rep);
++			cli_debug("OUTGOING: %s\n", rtsp_message_get_raw(rep));
++
++			r = rtsp_call_async(s->rtsp, rep, sink_teardown_fn,
++					    s, 1000 * 1000ULL, NULL);
++		}
++		if (r < 0) {
++			s->hup = true;
++			return cli_vERR(r);
++		}
++		return;
++	}
++
++	if (!strcmp(trigger, "PAUSE")) {
++		r = sink_send_session_request(s, "PAUSE", sink_pause_fn);
++		if (r < 0)
++			return cli_vERR(r);
++		return;
++	}
++
++	if (!strcmp(trigger, "PLAY")) {
++		r = sink_send_session_request(s, "PLAY", sink_resume_fn);
++		if (r < 0)
++			return cli_vERR(r);
++		return;
++	}
++
+ 	if (!strcmp(trigger, "SETUP")) {
+ 		if (!s->url) {
+ 			cli_error("No valid wfd_presentation_URL\n");
+@@ -474,6 +636,9 @@
+ 
+ static int sink_connect(struct ctl_sink *s)
+ {
++	const char *mark_string;
++	char *mark_end;
++	unsigned long mark_value;
+ 	int fd, r;
+ 
+ 	if (!s)
+@@ -489,6 +654,26 @@
+ 	if (fd < 0)
+ 		return cli_ERRNO();
+ 
++	mark_string = getenv("MIRACLECAST_SOCKET_MARK");
++	if (mark_string && *mark_string) {
++		errno = 0;
++		mark_value = strtoul(mark_string, &mark_end, 0);
++		if (errno || mark_end == mark_string || *mark_end ||
++		    mark_value > UINT32_MAX) {
++			r = -EINVAL;
++			cli_vERR(r);
++			goto err_close;
++		}
++
++		uint32_t mark = mark_value;
++		r = setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
++		if (r < 0) {
++			r = -errno;
++			cli_vERR(r);
++			goto err_close;
++		}
++	}
++
+ 	r = connect(fd, (struct sockaddr*)&s->addr, s->addr_size);
+ 	if (r < 0) {
+ 		r = -errno;
+@@ -532,6 +717,8 @@
+ 	s->fd = -1;
+ 	s->connected = false;
+ 	s->hup = false;
++	free(s->session);
++	s->session = NULL;
+ }
+ 
+ /*
+--- miraclecast.orig/src/ctl/ctl-wifi.c
++++ miraclecast/src/ctl/ctl-wifi.c
+@@ -698,7 +698,8 @@
+ 
+ 	if (!l)
+ 		return cli_EINVAL();
+-	if (l->p2p_scanning == val)
++	/* Cached Scanning may remain true after a queued P2P_CANCEL. */
++	if (!val && !l->p2p_scanning)
+ 		return 0;
+ 
+ 	r = sd_bus_path_encode("/org/freedesktop/miracle/wifi/link",
+--- miraclecast.orig/src/ctl/ctl.h
++++ miraclecast/src/ctl/ctl.h
+@@ -128,6 +128,7 @@
+ 
+ int ctl_sink_connect(struct ctl_sink *s, const char *target);
+ void ctl_sink_close(struct ctl_sink *s);
++void ctl_sink_request_idr(struct ctl_sink *s);
+ bool ctl_sink_is_connecting(struct ctl_sink *s);
+ bool ctl_sink_is_connected(struct ctl_sink *s);
+ bool ctl_sink_is_closed(struct ctl_sink *s);
+@@ -225,6 +226,7 @@
+ extern sd_event *cli_event;
+ extern sd_bus *cli_bus;
+ 
++extern bool wfd_audio_enabled;
+ extern unsigned int wfd_supported_res_cea;
+ extern unsigned int wfd_supported_res_vesa;
+ extern unsigned int wfd_supported_res_hh;
+@@ -258,6 +260,9 @@
+ void ctl_fn_sink_connected(struct ctl_sink *s);
+ void ctl_fn_sink_disconnected(struct ctl_sink *s);
+ void ctl_fn_sink_resolution_set(struct ctl_sink *s);
++void ctl_fn_sink_paused(struct ctl_sink *s);
++void ctl_fn_sink_resumed(struct ctl_sink *s);
++void ctl_fn_sink_standby(struct ctl_sink *s);
+ 
+ void cli_fn_help(void);
+ 
+--- miraclecast.orig/src/ctl/sinkctl.c
++++ miraclecast/src/ctl/sinkctl.c
+@@ -19,9 +19,14 @@
+ 
+ #include "config.h"
+ 
++#include <arpa/inet.h>
+ #include <errno.h>
++#include <fcntl.h>
+ #include <getopt.h>
++#include <ifaddrs.h>
+ #include <locale.h>
++#include <net/if.h>
++#include <netinet/in.h>
+ #include <signal.h>
+ #include <stdarg.h>
+ #include <stdbool.h>
+@@ -30,6 +35,7 @@
+ #include <strings.h>
+ #include <sys/signalfd.h>
+ #include <sys/time.h>
++#include <sys/wait.h>
+ #include <systemd/sd-bus.h>
+ #include <systemd/sd-event.h>
+ 
+@@ -41,6 +47,7 @@
+ #include <unistd.h>
+ #include "ctl.h"
+ #include "ctl-sink.h"
++#include "sink-player.h"
+ #include "wfd.h"
+ #include "shl_macro.h"
+ #include "shl_util.h"
+@@ -53,33 +60,64 @@
+ 
+ #define CLI_PROMPT "\001" CLI_BLUE "\002" "[sinkctl] # " "\001" CLI_DEFAULT "\002"
+ 
++#define SINK_CONNECT_FAST_WINDOW_USEC (2 * 1000ULL * 1000ULL)
++#define SINK_CONNECT_FAST_RETRY_USEC (200 * 1000ULL)
++#define SINK_CONNECT_SLOW_RETRY_USEC (500 * 1000ULL)
++#define SINK_CONNECT_DEADLINE_USEC (15 * 1000ULL * 1000ULL)
++#define SESSION_START_DEADLINE_USEC (30 * 1000ULL * 1000ULL)
++
+ static sd_bus *bus;
+ static struct ctl_wifi *wifi;
+ static struct ctl_sink *sink;
+ static sd_event_source *scan_timeout;
+ static sd_event_source *sink_timeout;
+-static unsigned int sink_timeout_time;
++static sd_event_source *session_start_timeout;
++static bool session_negotiated;
++static bool session_video_ready;
++static uint64_t sink_connect_started;
+ static bool sink_connected;
+-static pid_t sink_pid;
+ 
+ static char *bound_link;
+ static struct ctl_link *running_link;
+ static struct ctl_peer *running_peer;
+ static struct ctl_peer *pending_peer;
+ 
+-void launch_player(struct ctl_sink *s);
++static int sink_timeout_fn(sd_event_source *s, uint64_t usec, void *data);
++static void end_session(void);
++static void release_running_peer(bool disconnect);
+ 
+-char *gst_scale_res;
+-int gst_audio_en = 1;
+ static const int DEFAULT_RSTP_PORT = 7236;
+ bool uibc_option;
+ bool uibc_enabled;
+-bool external_player;
+ int rstp_port;
+ int uibc_port;
+-char* player;
+ GHashTable* protocol_extensions;
+ 
++/* Windows requires answers to microsoft_* queries; "none" declines the feature. */
++static const struct {
++	const char *key;
++	const char *value;
++} protocol_extension_defaults[] = {
++	{ "wfd_connector_type",				"05" },
++	{ "wfd_display_edid",				"none" },
++	{ "wfd_coupled_sink",				"none" },
++	{ "wfd_3d_video_formats",			"none" },
++	{ "wfd_idr_request_capability",			"1" },
++	{ "wfd_standby_resume_capability",		"supported" },
++	{ "microsoft_cursor",				"none" },
++	{ "microsoft_diagnostics_capability",		"none" },
++	{ "microsoft_format_change_capability",		"none" },
++	{ "microsoft_latency_management_capability",	"none" },
++	{ "microsoft_rtcp_capability",			"none" },
++};
++
++static char *player_video_decoder;
++static char *player_video_caps;
++static char *player_video_sink;
++static char *player_audio_sink;
++static char *display_power_cmd;
++
++bool wfd_audio_enabled = true;
+ unsigned int wfd_supported_res_cea  = 0x0001ffff;
+ unsigned int wfd_supported_res_vesa = 0x1fffffff;
+ unsigned int wfd_supported_res_hh   = 0x00001fff;
+@@ -259,7 +297,9 @@
+ 		return;
+ 
+ 	running_link = l;
+-	ctl_link_set_wfd_subelements(l, "000600111c4400c8");
++	/* WFD Device Information bit 10: audio unsupported at primary sink. */
++	ctl_link_set_wfd_subelements(l, wfd_audio_enabled ?
++				    "000600111c4400c8" : "000604111c4400c8");
+ 	ctl_link_set_p2p_scanning(l, true);
+ 	cli_printf("now running on link %s\n", running_link->label);
+ }
+@@ -394,6 +434,42 @@
+ 	}
+ }
+ 
++static void finish_session_start(void)
++{
++	if (session_negotiated && session_video_ready)
++		stop_timeout(&session_start_timeout);
++}
++
++static int session_start_timeout_fn(sd_event_source *s, uint64_t usec, void *data)
++{
++	cli_error("RTSP negotiation and video did not become ready within 30 seconds");
++	end_session();
++	release_running_peer(true);
++	return 0;
++}
++
++static void schedule_sink_retry(void)
++{
++	uint64_t delay, elapsed, now, remaining;
++
++	now = shl_now(CLOCK_MONOTONIC);
++	elapsed = now - sink_connect_started;
++	if (elapsed >= SINK_CONNECT_DEADLINE_USEC) {
++		delay = 0;
++		remaining = 0;
++	} else if (elapsed < SINK_CONNECT_FAST_WINDOW_USEC) {
++		delay = SINK_CONNECT_FAST_RETRY_USEC;
++		remaining = SINK_CONNECT_DEADLINE_USEC - elapsed;
++	} else {
++		delay = SINK_CONNECT_SLOW_RETRY_USEC;
++		remaining = SINK_CONNECT_DEADLINE_USEC - elapsed;
++	}
++	if (delay > remaining)
++		delay = remaining;
++
++	schedule_timeout(&sink_timeout, delay, sink_timeout_fn, NULL);
++}
++
+ static int scan_timeout_fn(sd_event_source *s, uint64_t usec, void *data)
+ {
+ 	stop_timeout(&scan_timeout);
+@@ -403,6 +479,7 @@
+ 			cli_printf("[" CLI_RED "TIMEOUT" CLI_DEFAULT "] waiting for %s\n",
+ 				pending_peer->friendly_name);
+ 		}
++		ctl_peer_disconnect(pending_peer);
+ 		pending_peer = NULL;
+ 	}
+ 
+@@ -414,25 +491,31 @@
+ 
+ static int sink_timeout_fn(sd_event_source *s, uint64_t usec, void *data)
+ {
++	uint64_t elapsed;
+ 	int r;
+ 
+ 	stop_timeout(&sink_timeout);
+ 
+-	if (running_peer &&
+-	    running_peer->connected &&
+-	    ctl_sink_is_closed(sink)) {
+-		r = ctl_sink_connect(sink, running_peer->remote_address);
+-		if (r < 0) {
+-			if (sink_timeout_time++ >= 3)
+-				cli_vERR(r);
+-			else
+-				schedule_timeout(&sink_timeout,
+-						 sink_timeout_time * 1000ULL * 1000ULL,
+-						 sink_timeout_fn,
+-						 NULL);
+-		}
++	if (!running_peer || !running_peer->connected ||
++	    ctl_sink_is_connected(sink))
++		return 0;
++
++	elapsed = shl_now(CLOCK_MONOTONIC) - sink_connect_started;
++	if (elapsed >= SINK_CONNECT_DEADLINE_USEC) {
++		cli_error("RTSP endpoint did not become ready within 15 seconds");
++		end_session();
++		release_running_peer(true);
++		return 0;
+ 	}
+ 
++	if (ctl_sink_is_connecting(sink))
++		ctl_sink_close(sink);
++
++	r = ctl_sink_connect(sink, running_peer->remote_address);
++	if (r < 0)
++		cli_debug("RTSP endpoint is not ready: %d", r);
++
++	schedule_sink_retry();
+ 	return 0;
+ }
+ 
+@@ -449,115 +532,183 @@
+ 	{ },
+ };
+ 
+-static void spawn_gst(struct ctl_sink *s)
++static sd_event_source *player_notify_source;
++static sd_event_source *transport_timer;
++static struct in_addr transport_address;
++
++#define TRANSPORT_CHECK_INTERVAL_USEC (100 * 1000ULL)
++
++static bool run_display_power(const char *verb)
+ {
+-	pid_t pid;
+-	int fd_journal;
+ 	sigset_t mask;
++	pid_t pid;
++	int status;
+ 
+-	if (sink_pid > 0)
+-		return;
++	if (!display_power_cmd)
++		return true;
+ 
+ 	pid = fork();
+ 	if (pid < 0) {
+-		return cli_vERRNO();
+-	} else if (!pid) {
+-		/* child */
+-
++		cli_vERRNO();
++		return false;
++	}
++	if (!pid) {
+ 		sigemptyset(&mask);
+ 		sigprocmask(SIG_SETMASK, &mask, NULL);
++		execl(display_power_cmd,
++		      display_power_cmd, verb, "miracle", NULL);
++		_exit(127);
++	}
+ 
+-#ifdef ENABLE_SYSTEMD
+-		/* redirect stdout/stderr to journal */
+-		fd_journal = sd_journal_stream_fd("miracle-sinkctl-gst",
+-						  LOG_DEBUG,
+-						  false);
+-		if (fd_journal >= 0) {
+-			/* dup journal-fd to stdout and stderr */
+-			dup2(fd_journal, 1);
+-			dup2(fd_journal, 2);
+-		} else {
+-#endif
+-			/* no journal? redirect stdout to parent's stderr */
+-			dup2(2, 1);
+-#ifdef ENABLE_SYSTEMD
+-		}
+-#endif
++	int r;
++	do {
++		r = waitpid(pid, &status, 0);
++	} while (r < 0 && errno == EINTR);
++	if (r < 0) {
++		cli_vERRNO();
++		return false;
++	}
++	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
++		cli_error("display power %s failed", verb);
++		return false;
++	}
++	return true;
++}
+ 
+-		launch_player(s);
+-		_exit(1);
+-	} else {
+-		sink_pid = pid;
++/* Some sources vanish without TEARDOWN or TCP close. */
++static bool transport_alive(void)
++{
++	struct ifaddrs *addrs, *a;
++	struct sockaddr_in *sa;
++	bool alive = false;
++
++	if (getifaddrs(&addrs) < 0)
++		return true;
++
++	for (a = addrs; a; a = a->ifa_next) {
++		if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET)
++			continue;
++		sa = (struct sockaddr_in *)a->ifa_addr;
++		if (sa->sin_addr.s_addr != transport_address.s_addr)
++			continue;
++		alive = (a->ifa_flags & IFF_RUNNING);
++		break;
+ 	}
++	freeifaddrs(addrs);
++	return alive;
+ }
+ 
+-void launch_player(struct ctl_sink *s) {
+-	char *argv[64];
+-	char resolution[64];
+-	char port[64];
+-	char uibc_portStr[64];
+-	int i = 0;
+-   if (!external_player) {
+-	   if (uibc_enabled) {
+-	   	player = "uibc-viewer";
+-	   } else {
+-	   	player = "miracle-gst";
+-	   }
+-   }
++static int transport_timer_fn(sd_event_source *source,
++			      uint64_t usec,
++			      void *data)
++{
++	if (!transport_alive()) {
++		cli_notice("session transport is gone; ending session");
++		end_session();
++		release_running_peer(true);
++		return 0;
++	}
+ 
+-	argv[i++] = player;
+-	if (uibc_enabled) {
+-		argv[i++] = s->target;
+-		sprintf(uibc_portStr, "%d", uibc_port);
+-		argv[i++] = uibc_portStr;
+-	}
+-	if (gst_debug) {
+-		argv[i++] = "-d";
+-		argv[i++] = gst_debug;
+-	} else if (cli_max_sev >= LOG_DEBUG) {
+-		argv[i++] = "-d";
+-		argv[i++] = "3";
+-	}
+-	if (gst_audio_en)
+-		argv[i++] = "-a";
+-	if (gst_scale_res) {
+-		argv[i++] = "-s";
+-		argv[i++] = gst_scale_res;
+-	}
+-	argv[i++] = "-p";
+-	sprintf(port, "%d", rstp_port);
+-	argv[i++] = port;
+-
+-	if (s->hres && s->vres) {
+-		sprintf(resolution, "%dx%d", s->hres, s->vres);
+-		argv[i++] = "-r";
+-		argv[i++] = resolution;
+-	}
+-
+-   argv[i] = NULL;
+-
+-   i = 0;
+-   size_t size = 0;
+-   while (argv[i]) {
+-      size += strlen(argv[i++]) + 1;
+-   }
++	sd_event_source_set_time(source,
++				 usec + TRANSPORT_CHECK_INTERVAL_USEC);
++	sd_event_source_set_enabled(source, SD_EVENT_ONESHOT);
++	return 0;
++}
+ 
+-   char* player_command = malloc(size);
+-   i = 0;
+-   strcpy(player_command, argv[i++]);
+-   while (argv[i]) {
+-      strcat(player_command, " ");
+-      strcat(player_command, argv[i++]);
+-   }
+-   log_debug("player command: %s", player_command);
+-   if (execvpe(argv[0], argv, environ) < 0) {
+-      cli_debug("stream player failed (%d): %m", errno);
+-      int i = 0;
+-      cli_debug("printing environment: ");
+-      while (environ[i]) {
+-         cli_debug("%s", environ[i++]);
+-      }
+-   }
++static void start_transport_monitor(const char *address)
++{
++	stop_timeout(&transport_timer);
++	if (address && strcmp(address, "0.0.0.0") &&
++	    inet_pton(AF_INET, address, &transport_address) == 1)
++		schedule_timeout(&transport_timer, TRANSPORT_CHECK_INTERVAL_USEC,
++				 transport_timer_fn, NULL);
++}
++
++static int player_notify_fn(sd_event_source *source,
++			    int fd,
++			    uint32_t revents,
++			    void *data)
++{
++	char buf[64];
++	ssize_t len, i;
++	bool idr = false;
++	bool ready = false;
++	bool stopped = false;
++
++	len = read(fd, buf, sizeof(buf));
++	for (i = 0; i < len; i++) {
++		if (buf[i] == SINK_PLAYER_EVENT_IDR)
++			idr = true;
++		else if (buf[i] == SINK_PLAYER_EVENT_READY)
++			ready = true;
++		else if (buf[i] == SINK_PLAYER_EVENT_STOPPED)
++			stopped = true;
++	}
++	if (len == 0 || (revents & (EPOLLHUP | EPOLLERR)))
++		stopped = true;
++
++	if (ready && !stopped) {
++		session_video_ready = true;
++		finish_session_start();
++	}
++
++	if (idr && !stopped)
++		ctl_sink_request_idr(sink);
++
++	if (stopped) {
++		cli_notice("stream player stopped");
++		end_session();
++		release_running_peer(true);
++	}
++
++	return 0;
++}
++
++static void start_player(struct ctl_sink *s)
++{
++	struct sink_player_config config = {
++		.bind_address = running_peer ?
++				running_peer->local_address : NULL,
++		.port = rstp_port,
++		.video_decoder = player_video_decoder,
++		.video_caps = player_video_caps,
++		.video_sink = player_video_sink,
++		/* Missing audio must not hold video in preroll. */
++		.audio_sink = wfd_audio_enabled ? player_audio_sink :
++			"fakesink sync=false async=false",
++		.gst_debug = gst_debug,
++	};
++	int r;
++
++	if (sink_player_running())
++		return;
++
++	if (!run_display_power("acquire")) {
++		end_session();
++		release_running_peer(true);
++		return;
++	}
++
++	r = sink_player_start(&config);
++	if (r >= 0) {
++		r = sd_event_add_io(cli_event,
++				    &player_notify_source,
++				    sink_player_notify_fd(),
++				    EPOLLIN,
++				    player_notify_fn,
++				    NULL);
++		if (r < 0)
++			sink_player_stop();
++	}
++	if (r < 0) {
++		cli_vERR(r);
++		run_display_power("release");
++		end_session();
++		release_running_peer(true);
++		return;
++	}
++
++	start_transport_monitor(config.bind_address);
+ }
+ 
+ void launch_uibc_daemon(int port) {
+@@ -574,37 +725,136 @@
+ 	execvpe(argv[0], argv, environ);
+ }
+ 
+-static void kill_gst(void)
++static bool session_paused;
++static bool session_standby;
++
++static void release_player(void)
+ {
+-	if (sink_pid <= 0)
++	player_notify_source = sd_event_source_unref(player_notify_source);
++
++	if (sink_player_running())
++		sink_player_stop();
++	run_display_power("release");
++	/* The session owns the lease even after the renderer exits. */
++}
++
++static void kill_player(void)
++{
++	transport_timer = sd_event_source_unref(transport_timer);
++	session_paused = false;
++	session_standby = false;
++	release_player();
++}
++
++static void end_session(void)
++{
++	stop_timeout(&sink_timeout);
++	stop_timeout(&session_start_timeout);
++	session_negotiated = false;
++	session_video_ready = false;
++	sink_connected = false;
++	kill_player();
++	ctl_sink_close(sink);
++}
++
++static void release_running_peer(bool disconnect)
++{
++	struct ctl_peer *p = running_peer;
++
++	if (!p)
+ 		return;
+ 
+-	kill(sink_pid, SIGTERM);
+-	sink_pid = 0;
++	cli_printf("no longer running on peer %s\n", p->label);
++	running_peer = NULL;
++	stop_timeout(&scan_timeout);
++	if (disconnect)
++		ctl_peer_disconnect(p);
++	ctl_link_set_p2p_scanning(p->l, true);
+ }
+ 
+ void ctl_fn_sink_connected(struct ctl_sink *s)
+ {
+ 	cli_notice("SINK connected");
++	stop_timeout(&sink_timeout);
+ 	sink_connected = true;
++
++	/* Partial media and early standby must not extend the startup deadline. */
++	schedule_timeout(&session_start_timeout, SESSION_START_DEADLINE_USEC,
++			 session_start_timeout_fn, NULL);
++	if (!session_start_timeout) {
++		end_session();
++		release_running_peer(true);
++	}
+ }
+ 
+ void ctl_fn_sink_disconnected(struct ctl_sink *s)
+ {
+ 	if (!sink_connected) {
+-		/* treat HUP as timeout */
+-		sink_timeout_fn(sink_timeout, 0, NULL);
++		schedule_sink_retry();
+ 	} else {
+ 		cli_notice("SINK disconnected");
+-		sink_connected = false;
++
++		end_session();
++		release_running_peer(true);
+ 	}
+ }
+ 
++void ctl_fn_sink_paused(struct ctl_sink *s)
++{
++	cli_notice("SINK paused by source");
++	session_paused = true;
++	sink_player_set_paused(true);
++}
++
++void ctl_fn_sink_standby(struct ctl_sink *s)
++{
++	cli_notice("SINK entering standby");
++	if (session_standby)
++		return;
++
++	session_paused = true;
++	session_standby = true;
++
++	/* Join the renderer before releasing KMS ownership. */
++	release_player();
++}
++
++void ctl_fn_sink_resumed(struct ctl_sink *s)
++{
++	cli_notice("SINK resumed");
++	session_negotiated = true;
++	finish_session_start();
++
++	if (session_standby) {
++		session_standby = false;
++		start_player(s);
++		if (!sink_player_running())
++			return;
++	}
++
++	if (!session_paused)
++		return;
++	session_paused = false;
++	sink_player_set_paused(false);
++
++	sink_player_reset_video();
++	ctl_sink_request_idr(s);
++}
++
+ void ctl_fn_sink_resolution_set(struct ctl_sink *s)
+ {
+ 	cli_printf("SINK set resolution %dx%d\n", s->hres, s->vres);
+-	if (sink_connected)
+-		spawn_gst(s);
++	if (!sink_connected || session_standby)
++		return;
++
++	if (!sink_player_running()) {
++		start_player(s);
++		return;
++	}
++
++	/* Windows encoder changes may omit SPS/PPS/IDR; demand a new keyframe. */
++	sink_player_reset_video();
++	ctl_sink_request_idr(s);
+ }
+ 
+ void ctl_fn_peer_new(struct ctl_peer *p)
+@@ -631,14 +881,8 @@
+ 	}
+ 
+ 	if (p == running_peer) {
+-		cli_printf("no longer running on peer %s\n",
+-			   running_peer->label);
+-		stop_timeout(&sink_timeout);
+-		kill_gst();
+-		ctl_sink_close(sink);
+-		running_peer = NULL;
+-		stop_timeout(&scan_timeout);
+-		ctl_link_set_p2p_scanning(p->l, true);
++		end_session();
++		release_running_peer(false);
+ 	}
+ 
+ 	if (cli_running())
+@@ -656,6 +900,16 @@
+ 	if (cli_running())
+ 		cli_printf("[" CLI_YELLOW "PROV" CLI_DEFAULT "] Peer: %s Type: %s PIN: %s\n",
+ 			   p->label, prov, pin);
++
++	if (!running_peer && (!pending_peer || pending_peer == p)) {
++		if (ctl_peer_connect(p, "auto", "") < 0)
++			return;
++		pending_peer = p;
++		schedule_timeout(&scan_timeout,
++				 10 * 1000ULL * 1000ULL,
++				 scan_timeout_fn,
++				 NULL);
++	}
+ }
+ 
+ void ctl_fn_peer_go_neg_request(struct ctl_peer *p,
+@@ -669,9 +923,10 @@
+ 		cli_printf("[" CLI_YELLOW "GO NEG" CLI_DEFAULT "] Peer: %s Type: %s PIN: %s\n",
+ 			   p->label, prov, pin);
+ 
+-	if (!running_peer) {
++	if (!running_peer && (!pending_peer || pending_peer == p)) {
+ 		/* auto accept any incoming connection attempt */
+-		ctl_peer_connect(p, "auto", "");
++		if (ctl_peer_connect(p, "auto", "") < 0)
++			return;
+ 		pending_peer = p;
+ 
+ 		/* 60s timeout in case the connect fails. Yes, stupid wpas does
+@@ -695,6 +950,8 @@
+ 			   p->label, reason);
+ 
+ 	if (!running_peer) {
++		if (pending_peer == p)
++			pending_peer = NULL;
+ 		stop_timeout(&scan_timeout);
+ 		ctl_link_set_p2p_scanning(p->l, true);
+ 	}
+@@ -717,11 +974,8 @@
+ 		stop_timeout(&scan_timeout);
+ 
+ 		sink_connected = false;
+-		sink_timeout_time = 1;
+-		schedule_timeout(&sink_timeout,
+-				 sink_timeout_time * 1000ULL * 1000ULL,
+-				 sink_timeout_fn,
+-				 NULL);
++		sink_connect_started = shl_now(CLOCK_MONOTONIC);
++		sink_timeout_fn(NULL, 0, NULL);
+ 	}
+ }
+ 
+@@ -731,14 +985,8 @@
+ 		return;
+ 
+ 	if (p == running_peer) {
+-		cli_printf("no longer running on peer %s\n",
+-			   running_peer->label);
+-		stop_timeout(&sink_timeout);
+-		kill_gst();
+-		ctl_sink_close(sink);
+-		running_peer = NULL;
+-		stop_timeout(&scan_timeout);
+-		ctl_link_set_p2p_scanning(p->l, true);
++		end_session();
++		release_running_peer(false);
+ 	}
+ 
+ 	if (cli_running())
+@@ -792,18 +1040,21 @@
+ 	       "\n"
+ 	       "     --log-journal-level <lvl>   Maximum level for journal log messages\n"
+ 	       "     --gst-debug [cat:]lvl[,...] List of categories an level of debug\n"
+-	       "     --audio <0/1>               Enable audio support (default %d)\n"
+-	       "     --scale WxH                 Scale to resolution\n"
+ 	       "  -p --port <port>                  Port for rtsp (default %d)\n"
+ 	       "     --uibc                         Enables UIBC\n"
+-	       "  -e --external-player           Configure player to use\n"
++	       "     --video-decoder <element>   H.264 decoder element\n"
++	       "     --video-caps <caps>         Decoded video caps\n"
++	       "     --video-sink <element>      Video sink element\n"
++	       "     --audio-sink <element>      Audio sink element\n"
++	       "     --no-audio                  Advertise video-only support and discard audio\n"
++	       "     --display-power-cmd <path>  Display ownership claim helper\n"
+ 	       "     --res <n,n,n>               Supported resolutions masks (CEA, VESA, HH)\n"
+ 	       "                                    default CEA  %08X\n"
+ 	       "                                    default VESA %08X\n"
+ 	       "                                    default HH   %08X\n"
+ 	       "     --help-res                  Shows available values for res\n"
+ 	       "\n"
+-	       , program_invocation_short_name, gst_audio_en, DEFAULT_RSTP_PORT,
++	       , program_invocation_short_name, DEFAULT_RSTP_PORT,
+ 		   wfd_supported_res_cea, wfd_supported_res_vesa, wfd_supported_res_hh
+ 	       );
+ 	/*
+@@ -838,6 +1089,8 @@
+ 	r = cli_run();
+ 
+ error:
++	/* The player thread ignores termination signals; stop it explicitly. */
++	kill_player();
+ 	ctl_sink_free(sink);
+ 	cli_destroy();
+ 	return r;
+@@ -849,12 +1102,6 @@
+ 	struct ctl_link *l;
+ 	int r, left;
+ 
+-   if (getuid() != 0) {
+-      r = EACCES;
+-		log_notice("Must run as root");
+-      return r;
+-	}
+-
+ 	r = ctl_wifi_new(&wifi, bus);
+ 	if (r < 0)
+ 		return r;
+@@ -874,6 +1121,18 @@
+ 	return r;
+ }
+ 
++static void init_protocol_extensions(void)
++{
++	size_t i;
++
++	protocol_extensions = g_hash_table_new(g_str_hash, g_str_equal);
++	for (i = 0; i < SHL_ARRAY_LENGTH(protocol_extension_defaults); i++)
++		g_hash_table_insert(
++			protocol_extensions,
++			(gpointer)protocol_extension_defaults[i].key,
++			(gpointer)protocol_extension_defaults[i].value);
++}
++
+ static int parse_argv(int argc, char *argv[])
+ {
+ 	enum {
+@@ -883,11 +1142,15 @@
+ 		ARG_LOG_DATE_TIME,
+ 		ARG_JOURNAL_LEVEL,
+ 		ARG_GST_DEBUG,
+-		ARG_AUDIO,
+-		ARG_SCALE,
+ 		ARG_RES,
+ 		ARG_HELP_RES,
+ 		ARG_UIBC,
++		ARG_VIDEO_DECODER,
++		ARG_VIDEO_CAPS,
++		ARG_VIDEO_SINK,
++		ARG_AUDIO_SINK,
++		ARG_NO_AUDIO,
++		ARG_DISPLAY_POWER_CMD,
+       ARG_HELP_COMMANDS,
+ 	};
+ 	static const struct option options[] = {
+@@ -899,23 +1162,25 @@
+ 		{ "log-date-time",	no_argument,		NULL,	ARG_LOG_DATE_TIME },
+ 		{ "log-journal-level",	required_argument,	NULL,	ARG_JOURNAL_LEVEL },
+ 		{ "gst-debug",	required_argument,	NULL,	ARG_GST_DEBUG },
+-		{ "audio",	required_argument,	NULL,	ARG_AUDIO },
+-		{ "scale",	required_argument,	NULL,	ARG_SCALE },
+ 		{ "res",	required_argument,	NULL,	ARG_RES },
+ 		{ "help-res",	no_argument,	NULL,	ARG_HELP_RES },
+ 		{ "port",		required_argument,	NULL,	'p' },
+ 		{ "uibc",		no_argument,		NULL,	ARG_UIBC },
+-		{ "external-player",		required_argument,		NULL,	'e' },
++		{ "video-decoder",	required_argument,	NULL,	ARG_VIDEO_DECODER },
++		{ "video-caps",		required_argument,	NULL,	ARG_VIDEO_CAPS },
++		{ "video-sink",		required_argument,	NULL,	ARG_VIDEO_SINK },
++		{ "no-audio",		no_argument,		NULL,	ARG_NO_AUDIO },
++		{ "audio-sink",		required_argument,	NULL,	ARG_AUDIO_SINK },
++		{ "display-power-cmd",	required_argument,	NULL,	ARG_DISPLAY_POWER_CMD },
+ 		{}
+ 	};
+ 	int c;
+ 
+ 	uibc_option = false;
+ 	uibc_enabled = false;
+-   external_player = false;
+ 	rstp_port = DEFAULT_RSTP_PORT;
+ 
+-	while ((c = getopt_long(argc, argv, "he:p:", options, NULL)) >= 0) {
++	while ((c = getopt_long(argc, argv, "hp:", options, NULL)) >= 0) {
+ 		switch (c) {
+ 		case 'h':
+ 		   cli_fn_help();
+@@ -943,11 +1208,23 @@
+ 		case ARG_JOURNAL_LEVEL:
+ 			log_max_sev = log_parse_arg(optarg);
+ 			break;
+-		case ARG_AUDIO:
+-			gst_audio_en = atoi(optarg);
++		case ARG_VIDEO_DECODER:
++			player_video_decoder = optarg;
++			break;
++		case ARG_VIDEO_CAPS:
++			player_video_caps = optarg;
++			break;
++		case ARG_VIDEO_SINK:
++			player_video_sink = optarg;
++			break;
++		case ARG_NO_AUDIO:
++			wfd_audio_enabled = false;
++			break;
++		case ARG_AUDIO_SINK:
++			player_audio_sink = optarg;
+ 			break;
+-		case ARG_SCALE:
+-			gst_scale_res = optarg;
++		case ARG_DISPLAY_POWER_CMD:
++			display_power_cmd = optarg;
+ 			break;
+ 		case ARG_RES:
+ 			sscanf(optarg, "%x,%x,%x",
+@@ -958,10 +1235,6 @@
+ 		case 'p':
+ 			rstp_port = atoi(optarg);
+ 			break;
+-		case 'e':
+-			external_player = true;
+-			player = optarg;
+-			break;
+ 		case ARG_UIBC:
+ 			uibc_option = true;
+ 			break;
+@@ -980,14 +1253,13 @@
+ 
+ 	setlocale(LC_ALL, "");
+ 
++	/* INI extends.* keys must override these defaults. */
++	init_protocol_extensions();
++
+    GKeyFile* gkf = load_ini_file();
+ 
+    gchar** autocmds_free = NULL;
+    if (gkf) {
+-      player = g_key_file_get_string (gkf, "sinkctl", "external-player", NULL);
+-      if (player) {
+-			external_player = true;
+-      }
+       gchar* log_level;
+       log_level = g_key_file_get_string (gkf, "sinkctl", "log-journal-level", NULL);
+       if (log_level) {
+@@ -1028,7 +1300,6 @@
+       }
+       gchar** sinkctl_keys;
+       gsize len = 0;
+-      protocol_extensions = g_hash_table_new(g_str_hash, g_str_equal);
+ 
+       sinkctl_keys = g_key_file_get_keys (gkf,
+                                           "sinkctl",
+@@ -1057,6 +1328,9 @@
+ 		return EXIT_FAILURE;
+ 	}
+ 
++	/* sd-bus never reconnects; restart on a fresh bus. */
++	sd_bus_set_exit_on_disconnect(bus, true);
++
+ 	r = ctl_main(argc, argv);
+    g_strfreev(autocmds_free);
+    if (free_argv) {
+--- miraclecast.orig/src/ctl/wfd.c
++++ miraclecast/src/ctl/wfd.c
+@@ -21,6 +21,7 @@
+ #include <stdio.h>
+ #include <stdint.h>
+ #include "ctl.h"
++#include "shl_macro.h"
+ 
+ struct resolution_bitmap {
+ 	int index;
+@@ -218,3 +219,42 @@
+ 	}
+ 	return -EINVAL;
+ }
++
++/* Native-mode geometry must agree with the advertised masks. */
++uint8_t vfd_get_native_index(uint32_t cea_mask,
++			     uint32_t vesa_mask,
++			     uint32_t hh_mask)
++{
++	const struct resolution_bitmap *tables[] = {
++		resolutions_cea,
++		resolutions_vesa,
++		resolutions_hh,
++	};
++	const uint32_t masks[] = { cea_mask, vesa_mask, hh_mask };
++	unsigned int table;
++	int best_area = 0;
++	int best_fps = 0;
++	uint8_t native = 0;
++	int i, area;
++
++	for (table = 0; table < SHL_ARRAY_LENGTH(tables); table++) {
++		const struct resolution_bitmap *res = tables[table];
++
++		for (i = 0; res[i].hres != 0; i++) {
++			if (!((1U << res[i].index) & masks[table]))
++				continue;
++
++			area = res[i].hres * res[i].vres;
++			if (area < best_area)
++				continue;
++			if (area == best_area && res[i].fps <= best_fps)
++				continue;
++
++			best_area = area;
++			best_fps = res[i].fps;
++			native = (res[i].index << 3) | table;
++		}
++	}
++
++	return native;
++}
+--- miraclecast.orig/src/ctl/wfd.h
++++ miraclecast/src/ctl/wfd.h
+@@ -25,5 +25,8 @@
+ int vfd_get_cea_resolution(uint32_t mask, int *hres, int *vres);
+ int vfd_get_vesa_resolution(uint32_t mask, int *hres, int *vres);
+ int vfd_get_hh_resolution(uint32_t mask, int *hres, int *vres);
++uint8_t vfd_get_native_index(uint32_t cea_mask,
++			     uint32_t vesa_mask,
++			     uint32_t hh_mask);
+ 
+ #endif /* WFD_H */

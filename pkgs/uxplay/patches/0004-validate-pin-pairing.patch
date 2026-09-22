@@ -1,0 +1,317 @@
+Validate the PIN pairing sequence and plist payloads.
+
+Keep an explicit SRP challenge state and validate lengths before copying data.
+Borrow plist payloads and release request and response trees in one place.
+Reject missing content types and malformed requests without dumping pairing
+material into the log.
+
+--- uxplay.orig/lib/pairing.c
++++ uxplay/lib/pairing.c
+@@ -29,7 +29,14 @@
+ #define SALT_KEY "Pair-Verify-AES-Key"
+ #define SALT_IV "Pair-Verify-AES-IV"
+ 
++typedef enum {
++    SRP_INITIAL,
++    SRP_CHALLENGE,
++    SRP_VERIFIED
++} srp_state_t;
++
+ typedef struct srp_s {
++    srp_state_t state;
+     unsigned char salt[SRP_SALT_SIZE];
+     unsigned char verifier[SRP_VERIFIER_SIZE];
+     unsigned char session_key[SRP_SESSION_KEY_SIZE];
+@@ -515,7 +522,9 @@
+         return -2;
+     }
+ 
+-    get_random_bytes(session->srp->private_key, SRP_PRIVATE_KEY_SIZE);
++    if (get_random_bytes(session->srp->private_key, SRP_PRIVATE_KEY_SIZE) < 1) {
++        return -2;
++    }
+     
+     const unsigned char *srp_b = session->srp->private_key;
+     unsigned char * srp_B = NULL;
+@@ -548,13 +557,23 @@
+ 
+     *pk = (char *) srp_B;
+     *len_pk = len_B;
+-
++    if (!srp_B || len_B <= 0 || len_B > SRP_PK_SIZE) {
++        return -3;
++    }
++    session->srp->state = SRP_CHALLENGE;
+     return 0;
+ }
+ 
+ int
+ srp_validate_proof(pairing_session_t *session, pairing_t *pairing, const unsigned char *A,
+                     int len_A, unsigned char *proof, int client_proof_len, int proof_len) {
++    if (!session->srp || session->srp->state != SRP_CHALLENGE ||
++        !A || len_A <= 0 || len_A > SRP_PK_SIZE || !proof ||
++        client_proof_len != SRP_M2_SIZE || proof_len != SRP_M2_SIZE) {
++        return -1;
++    }
++    /* A failed proof consumes the challenge. */
++    session->srp->state = SRP_INITIAL;
+     int authenticated  = 0;
+     const unsigned char *B =  NULL;
+     const unsigned char *b = session->srp->private_key;
+@@ -571,6 +590,13 @@
+                                                     b, len_b,
+                                                     &B, &len_B, NULL, NULL, 1);
+ 
++    if (!verifier) {
++        return -1;
++    }
++    if (!B || len_B <= 0) {
++        srp_verifier_delete(verifier);
++        return -1;
++    }
+     srp_verifier_verify_session(verifier, proof, &M2);
+     authenticated = srp_verifier_is_authenticated(verifier);
+     if (authenticated == 0) {
+@@ -581,17 +607,23 @@
+         return -1;
+     }
+     session_key = srp_verifier_get_session_key(verifier, &len_K);
+-    if (len_K != SRP_SESSION_KEY_SIZE) {
++    if (!session_key || !M2 || len_K != SRP_SESSION_KEY_SIZE) {
++        srp_verifier_delete(verifier);
+         return -2;
+     }
+     memcpy(session->srp->session_key, session_key, len_K);
+     memcpy(proof, M2, proof_len);
++    session->srp->state = SRP_VERIFIED;
+     srp_verifier_delete(verifier);
+     return 0;
+ }
+ int
+ srp_confirm_pair_setup(pairing_session_t *session, pairing_t *pairing,
+                        unsigned char *epk, unsigned char *auth_tag) {
++    if (!session->srp || session->srp->state != SRP_VERIFIED) {
++        return -1;
++    }
++    session->srp->state = SRP_INITIAL;
+     unsigned char aesKey[16] = {0}, aesIV[16] = {0};
+     unsigned char hash[SHA512_DIGEST_LENGTH] = {0};
+     unsigned char pk[ED25519_KEY_SIZE] = {0};
+@@ -622,7 +654,7 @@
+     int pk_len_client  = gcm_decrypt(epk, ED25519_KEY_SIZE, pk, aesKey, aesIV, auth_tag);
+     if (pk_len_client <= 0) {
+        /* authentication failed */
+-         return pk_len_client;
++         return -1;
+     }
+ 
+     /* success, from server viewpoint */
+--- uxplay.orig/lib/raop_handlers.h
++++ uxplay/lib/raop_handlers.h
+@@ -278,35 +278,29 @@
+                            http_request_t *request, http_response_t *response,
+                            char **response_data, int *response_datalen) {
+     raop_t *raop = conn->raop;
+-    const char *request_data = NULL;;
++    const char *request_data = NULL;
++    plist_t req_root_node = NULL;
++    plist_t res_root_node = NULL;
+     int request_datalen = 0;
+-    bool data_is_plist = false;
+-    bool logger_debug = (logger_get_level(raop->logger) >= LOGGER_DEBUG);
++    const char *content_type = http_request_get_header(request, "Content-Type");
++
+     request_data = http_request_get_data(request, &request_datalen);
+-    logger_log(raop->logger, LOGGER_INFO, "client requested pair-setup-pin, datalen = %d", request_datalen);
+-    if (request_datalen > 0) {
+-        char *header_str= NULL; 
+-        http_request_get_header_string(request, &header_str);
+-        logger_log(raop->logger, LOGGER_INFO, "request header: %s", header_str);
+-        data_is_plist = (strstr(header_str,"apple-binary-plist") != NULL);
+-        free(header_str);
+-    }
+-    if (!data_is_plist) {
+-        logger_log(raop->logger, LOGGER_INFO, "did not receive expected plist from client, request_datalen = %d",
+-                  request_datalen);
++    if (request_datalen <= 0 || !content_type ||
++        !strstr(content_type, "apple-binary-plist"))
+         goto authentication_failed;
+-    }
+ 
+     /* process the pair-setup-pin request */
+-    plist_t req_root_node = NULL;
+     plist_from_bin(request_data, request_datalen, &req_root_node);
++    if (!PLIST_IS_DICT(req_root_node)) {
++        goto authentication_failed;
++    }
+     plist_t req_method_node = plist_dict_get_item(req_root_node, "method");
+     plist_t req_user_node = plist_dict_get_item(req_root_node, "user");
+     plist_t req_pk_node = plist_dict_get_item(req_root_node, "pk");
+     plist_t req_proof_node = plist_dict_get_item(req_root_node, "proof");
+     plist_t req_epk_node = plist_dict_get_item(req_root_node, "epk");
+     plist_t req_authtag_node = plist_dict_get_item(req_root_node, "authTag");
+-  
++
+     if (PLIST_IS_STRING(req_method_node) && PLIST_IS_STRING(req_user_node)) {
+         /* this is the initial pair-setup-pin request */
+         const char *salt = NULL;
+@@ -316,15 +310,15 @@
+         char *method = NULL;
+         char *user = NULL;
+         plist_get_string_val(req_method_node, &method);
+-        if (strncmp(method, "pin", strlen (method))) {
+-            logger_log(raop->logger, LOGGER_ERR, "error, required method is \"pin\", client requested \"%s\"", method);
++        if (!method || strcmp(method, "pin")) {
+             free (method);
+-            plist_free (req_root_node);
+-            return;
++            goto authentication_failed;
+         }
+         plist_mem_free(method);
+-        method = NULL;
+         plist_get_string_val(req_user_node, &user);
++        if (!user) {
++            goto authentication_failed;
++        }
+         logger_log(raop->logger, LOGGER_INFO, "pair-setup-pin:  device_id = %s", user);
+         snprintf(pin, 6, "%04u", raop->pin % 10000);
+         if (raop->pin < 10000) {
+@@ -333,87 +327,61 @@
+         int ret = srp_new_user(conn->session, raop->pairing, (const char *) user,
+                                (const char *) pin, &salt, &len_salt, &pk, &len_pk);
+         plist_mem_free(user);
+-        user = NULL;
+-        plist_free(req_root_node);
+         if (ret < 0) {
+             logger_log(raop->logger, LOGGER_ERR, "failed to create user, err = %d", ret);
+             goto authentication_failed;
+         }
+-        plist_t res_root_node = plist_new_dict();
++        res_root_node = plist_new_dict();
+         plist_t res_salt_node = plist_new_data(salt, len_salt);
+         plist_t res_pk_node = plist_new_data(pk, len_pk);
+-        plist_dict_set_item(res_root_node, "pk", res_pk_node);	
++        plist_dict_set_item(res_root_node, "pk", res_pk_node);
+         plist_dict_set_item(res_root_node, "salt", res_salt_node);
+-        plist_to_bin(res_root_node, response_data, (uint32_t*) response_datalen);
+-        plist_free(res_root_node);
+-        http_response_add_header(response, "Content-Type", "application/x-apple-binary-plist");
+-        return;
+     } else if (PLIST_IS_DATA(req_pk_node) && PLIST_IS_DATA(req_proof_node)) {
+         /* this is the second part of pair-setup-pin request */
+-        char *client_pk = NULL;
+-        char *client_proof = NULL;
++        const char *client_pk = NULL;
++        const char *client_proof = NULL;
+         unsigned char proof[64] = { '\0' };
+-        memset(proof, 0, sizeof(proof));
+         uint64_t client_pk_len = 0;
+         uint64_t client_proof_len = 0;
+-        plist_get_data_val(req_pk_node, &client_pk, &client_pk_len); 
+-        plist_get_data_val(req_proof_node, &client_proof, &client_proof_len);
+-        if (client_proof_len != sizeof(proof)) {
++        client_pk = plist_get_data_ptr(req_pk_node, &client_pk_len);
++        client_proof = plist_get_data_ptr(req_proof_node, &client_proof_len);
++        if (!client_pk || !client_proof || client_pk_len == 0 ||
++            client_pk_len > SRP_PK_SIZE || client_proof_len != sizeof(proof)) {
+             logger_log(raop->logger, LOGGER_ERR, "Client Authentication Failure (client_proof_len %d invalid)", (int) client_proof_len);
+             goto authentication_failed;
+         }
+-        if (logger_debug) {
+-            char *str = utils_data_to_string((const unsigned char *) client_proof, client_proof_len, 20);
+-            logger_log(raop->logger, LOGGER_DEBUG, "client SRP6a proof <M> :\n%s", str);	    
+-            free (str);
+-        }
+         memcpy(proof, client_proof, sizeof(proof));
+-        free (client_proof);
++
+         int ret = srp_validate_proof(conn->session, raop->pairing, (const unsigned char *) client_pk,
+                                      (int) client_pk_len, proof, (int) client_proof_len, (int) sizeof(proof));
+-        free (client_pk);
+-        plist_free(req_root_node);
++
+         if (ret < 0) {
+             logger_log(raop->logger, LOGGER_ERR, "Client Authentication Failure (client proof not validated)");
+             goto authentication_failed;
+         }
+-        if (logger_debug) {
+-	    char *str = utils_data_to_string((const unsigned char *) proof, sizeof(proof), 20);
+-            logger_log(raop->logger, LOGGER_DEBUG, "server SRP6a proof <M1> :\n%s", str);
+-            free (str);
+-        }
+-        plist_t res_root_node = plist_new_dict();
++        res_root_node = plist_new_dict();
+         plist_t res_proof_node = plist_new_data((const char *) proof, 20);
+-        plist_dict_set_item(res_root_node, "proof", res_proof_node);	
+-        plist_to_bin(res_root_node, response_data, (uint32_t*) response_datalen);
+-        plist_free(res_root_node);
+-        http_response_add_header(response, "Content-Type", "application/x-apple-binary-plist");
+-        return;
++        plist_dict_set_item(res_root_node, "proof", res_proof_node);
+     } else if (PLIST_IS_DATA(req_epk_node) && PLIST_IS_DATA(req_authtag_node)) {
+         /* this is the third part of pair-setup-pin request */
+-        char *client_epk = NULL;
+-        char *client_authtag = NULL;
++        const char *client_epk = NULL;
++        const char *client_authtag = NULL;
+         uint64_t client_epk_len = 0;
+         uint64_t client_authtag_len = 0;
+         unsigned char epk[ED25519_KEY_SIZE];
+         unsigned char authtag[GCM_AUTHTAG_SIZE];
+         int ret = 0;
+-        plist_get_data_val(req_epk_node, &client_epk, &client_epk_len); 
+-        plist_get_data_val(req_authtag_node, &client_authtag, &client_authtag_len);
++        client_epk = plist_get_data_ptr(req_epk_node, &client_epk_len);
++        client_authtag = plist_get_data_ptr(req_authtag_node, &client_authtag_len);
+ 
+-        if (logger_debug) {
+-            char *str = utils_data_to_string((const unsigned char *) client_epk, client_epk_len, 16);
+-            logger_log(raop->logger, LOGGER_DEBUG, "client_epk %d:\n%s\n", (int) client_epk_len, str);
+-            str = utils_data_to_string((const unsigned char *) client_authtag, client_authtag_len, 16);
+-            logger_log(raop->logger, LOGGER_DEBUG, "client_authtag  %d:\n%s\n", (int) client_authtag_len, str);
+-            free (str);
++        if (!client_epk || !client_authtag || client_epk_len != sizeof(epk) ||
++            client_authtag_len != sizeof(authtag)) {
++            goto authentication_failed;
+         }
+ 
+         memcpy(epk, client_epk, ED25519_KEY_SIZE);
+         memcpy(authtag, client_authtag, GCM_AUTHTAG_SIZE);
+-        free (client_authtag);
+-        free (client_epk);
+-        plist_free(req_root_node);
++
+         ret = srp_confirm_pair_setup(conn->session, raop->pairing, epk, authtag);
+         if (ret < 0) {
+             logger_log(raop->logger, LOGGER_ERR, "pair-pin-setup (step 3): client authentication failed\n");
+@@ -422,18 +390,23 @@
+             logger_log(raop->logger, LOGGER_DEBUG, "pair-pin-setup success\n");
+         }
+         pairing_session_set_setup_status(conn->session);
+-        plist_t res_root_node = plist_new_dict();
++        res_root_node = plist_new_dict();
+         plist_t res_epk_node = plist_new_data((const char *) epk, 32);
+         plist_t res_authtag_node = plist_new_data((const char *) authtag, 16);
+         plist_dict_set_item(res_root_node, "epk", res_epk_node);
+-        plist_dict_set_item(res_root_node, "authTag", res_authtag_node);	
+-        plist_to_bin(res_root_node, response_data, (uint32_t*) response_datalen);
+-        plist_free(res_root_node);
+-        http_response_add_header(response, "Content-Type", "application/x-apple-binary-plist");
+-        return;
++        plist_dict_set_item(res_root_node, "authTag", res_authtag_node);
++    } else {
++        goto authentication_failed;
+     }
+- authentication_failed:;
++    plist_to_bin(res_root_node, response_data, (uint32_t*) response_datalen);
++    http_response_add_header(response, "Content-Type", "application/x-apple-binary-plist");
++    goto out;
++
++authentication_failed:
+     http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
++out:
++    plist_free(res_root_node);
++    plist_free(req_root_node);
+ }
+ 
+ static void

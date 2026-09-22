@@ -1,0 +1,164 @@
+From eb3deeeea272d302ec3ea5a1355f40be955de82c Mon Sep 17 00:00:00 2001
+From: Alexander Yastrebov <yastrebov.alex@gmail.com>
+Date: Thu, 26 Dec 2024 20:36:53 +0100
+Subject: [PATCH 2/4] device: reduce RoutineHandshake allocations
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Reduce allocations by eliminating byte reader, hand-rolled decoding and
+reusing message structs.
+
+Synthetic benchmark:
+
+    var msgSink MessageInitiation
+    func BenchmarkMessageInitiationUnmarshal(b *testing.B) {
+        packet := make([]byte, MessageInitiationSize)
+        reader := bytes.NewReader(packet)
+        err := binary.Read(reader, binary.LittleEndian, &msgSink)
+        if err != nil {
+            b.Fatal(err)
+        }
+        b.Run("binary.Read", func(b *testing.B) {
+            b.ReportAllocs()
+            for range b.N {
+                reader := bytes.NewReader(packet)
+                _ = binary.Read(reader, binary.LittleEndian, &msgSink)
+            }
+        })
+        b.Run("unmarshal", func(b *testing.B) {
+            b.ReportAllocs()
+            for range b.N {
+                _ = msgSink.unmarshal(packet)
+            }
+        })
+    }
+
+Results:
+                                         │      -      │
+                                         │   sec/op    │
+MessageInitiationUnmarshal/binary.Read-8   1.508µ ± 2%
+MessageInitiationUnmarshal/unmarshal-8     12.66n ± 2%
+
+                                         │      -       │
+                                         │     B/op     │
+MessageInitiationUnmarshal/binary.Read-8   208.0 ± 0%
+MessageInitiationUnmarshal/unmarshal-8     0.000 ± 0%
+
+                                         │      -       │
+                                         │  allocs/op   │
+MessageInitiationUnmarshal/binary.Read-8   2.000 ± 0%
+MessageInitiationUnmarshal/unmarshal-8     0.000 ± 0%
+
+Signed-off-by: Alexander Yastrebov <yastrebov.alex@gmail.com>
+Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+(cherry picked from commit 9e7529c3d2d0c54f4d5384c01645a9279e4740ae)
+---
+ device/noise-protocol.go | 48 ++++++++++++++++++++++++++++++++++++++++
+ device/receive.go        | 10 +++------
+ 2 files changed, 51 insertions(+), 7 deletions(-)
+
+--- amneziawg-go.orig/device/noise-protocol.go
++++ amneziawg-go/device/noise-protocol.go
+@@ -7,6 +7,7 @@
+ 
+ import (
+ 	"crypto/rand"
++	"encoding/binary"
+ 	"errors"
+ 	"fmt"
+ 	"sync"
+@@ -118,6 +119,53 @@
+ 	Cookie   [blake2s.Size128 + poly1305.TagSize]byte
+ }
+ 
++var errMessageTooShort = errors.New("message too short")
++
++func (msg *MessageInitiation) unmarshal(b []byte) error {
++	if len(b) < MessageInitiationSize {
++		return errMessageTooShort
++	}
++
++	msg.Type = binary.LittleEndian.Uint32(b)
++	msg.Sender = binary.LittleEndian.Uint32(b[4:])
++	copy(msg.Ephemeral[:], b[8:])
++	copy(msg.Static[:], b[8+len(msg.Ephemeral):])
++	copy(msg.Timestamp[:], b[8+len(msg.Ephemeral)+len(msg.Static):])
++	copy(msg.MAC1[:], b[8+len(msg.Ephemeral)+len(msg.Static)+len(msg.Timestamp):])
++	copy(msg.MAC2[:], b[8+len(msg.Ephemeral)+len(msg.Static)+len(msg.Timestamp)+len(msg.MAC1):])
++
++	return nil
++}
++
++func (msg *MessageResponse) unmarshal(b []byte) error {
++	if len(b) < MessageResponseSize {
++		return errMessageTooShort
++	}
++
++	msg.Type = binary.LittleEndian.Uint32(b)
++	msg.Sender = binary.LittleEndian.Uint32(b[4:])
++	msg.Receiver = binary.LittleEndian.Uint32(b[8:])
++	copy(msg.Ephemeral[:], b[12:])
++	copy(msg.Empty[:], b[12+len(msg.Ephemeral):])
++	copy(msg.MAC1[:], b[12+len(msg.Ephemeral)+len(msg.Empty):])
++	copy(msg.MAC2[:], b[12+len(msg.Ephemeral)+len(msg.Empty)+len(msg.MAC1):])
++
++	return nil
++}
++
++func (msg *MessageCookieReply) unmarshal(b []byte) error {
++	if len(b) < MessageCookieReplySize {
++		return errMessageTooShort
++	}
++
++	msg.Type = binary.LittleEndian.Uint32(b)
++	msg.Receiver = binary.LittleEndian.Uint32(b[4:])
++	copy(msg.Nonce[:], b[8:])
++	copy(msg.Cookie[:], b[8+len(msg.Nonce):])
++
++	return nil
++}
++
+ type Handshake struct {
+ 	state                     handshakeState
+ 	mutex                     sync.RWMutex
+--- amneziawg-go.orig/device/receive.go
++++ amneziawg-go/device/receive.go
+@@ -6,7 +6,6 @@
+ package device
+ 
+ import (
+-	"bytes"
+ 	"encoding/binary"
+ 	"errors"
+ 	"net"
+@@ -327,8 +326,7 @@
+ 			// unmarshal packet
+ 
+ 			var reply MessageCookieReply
+-			reader := bytes.NewReader(elem.packet)
+-			err := binary.Read(reader, binary.LittleEndian, &reply)
++			err := reply.unmarshal(elem.packet)
+ 			if err != nil {
+ 				device.log.Verbosef("Failed to decode cookie reply")
+ 				goto skip
+@@ -397,8 +395,7 @@
+ 		case MessageInitiationType:
+ 			// unmarshal
+ 			var msg MessageInitiation
+-			reader := bytes.NewReader(elem.packet)
+-			err := binary.Read(reader, binary.LittleEndian, &msg)
++			err := msg.unmarshal(elem.packet)
+ 			if err != nil {
+ 				device.log.Errorf("Failed to decode initiation message")
+ 				goto skip
+@@ -432,8 +429,7 @@
+ 			// unmarshal
+ 
+ 			var msg MessageResponse
+-			reader := bytes.NewReader(elem.packet)
+-			err := binary.Read(reader, binary.LittleEndian, &msg)
++			err := msg.unmarshal(elem.packet)
+ 			if err != nil {
+ 				device.log.Errorf("Failed to decode response message")
+ 				goto skip

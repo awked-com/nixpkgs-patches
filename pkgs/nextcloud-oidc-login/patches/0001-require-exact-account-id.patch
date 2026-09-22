@@ -1,0 +1,16 @@
+--- nextcloud-oidc-login.orig/lib/Service/LoginService.php
++++ nextcloud-oidc-login/lib/Service/LoginService.php
+@@ -132,6 +132,13 @@
+ 
+         // Get user with fallback
+         $user = $this->userManager->get($uid);
++        // Nextcloud resolves UIDs case-insensitively, while the identity
++        // provider can issue distinct, case-sensitive identifiers. Never
++        // authenticate an alias of a different account or update its profile.
++        if (null !== $user && $user->getUID() !== $uid) {
++            throw new LoginException($this->l->t('The provider identifier does not exactly match the existing account'));
++        }
++
+ 
+         // Password can be empty unless first login.
+         // On first login, we cannot use a token to authenticate the user

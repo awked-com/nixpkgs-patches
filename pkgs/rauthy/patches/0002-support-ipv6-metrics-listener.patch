@@ -1,0 +1,40 @@
+--- rauthy.orig/src/bin/src/server.rs
++++ rauthy/src/bin/src/server.rs
+@@ -30,7 +30,7 @@
+ use rauthy_middlewares::principal::RauthyPrincipalMiddleware;
+ use std::cmp::max;
+ use std::error::Error;
+-use std::net::Ipv4Addr;
++use std::net::{IpAddr, SocketAddr};
+ use std::str::FromStr;
+ use std::thread;
+ use std::time::Duration;
+@@ -208,20 +208,20 @@
+ 
+     thread::spawn(move || {
+         let vars = &RauthyConfig::get().vars.server;
+-        if let Err(err) = Ipv4Addr::from_str(&vars.metrics_addr) {
+-            let msg = format!("Error parsing METRICS_ADDR: {err}");
+-            error!(msg);
+-            panic!("{}", msg);
+-        }
+-        let addr_full = format!("{}:{}", vars.metrics_addr, vars.metrics_port);
++        let addr = IpAddr::from_str(&vars.metrics_addr).unwrap_or_else(|err| {
++            let message = format!("Error parsing METRICS_ADDR: {err}");
++            error!(message);
++            panic!("{}", message);
++        });
++        let socket_addr = SocketAddr::new(addr, vars.metrics_port);
+ 
+-        info!("Metrics available on: http://{addr_full}/metrics");
++        info!("Metrics available on: http://{socket_addr}/metrics");
+         // TODO create single threaded runtime specifically -> probably use tokio
+         System::new()
+             .block_on(
+                 HttpServer::new(move || App::new().wrap(metrics.clone()))
+                     .workers(1)
+-                    .bind(addr_full)
++                    .bind(socket_addr)
+                     .unwrap()
+                     .run(),
+             )
