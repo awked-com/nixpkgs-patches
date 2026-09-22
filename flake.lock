@@ -7,11 +7,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1790116651,
-        "narHash": "sha256-u8y/8gjJxABbUPo7r0ucXUXtyBoRFRlzy2lHajHhOx8=",
+        "lastModified": 1790117752,
+        "narHash": "sha256-V28wa/8KXcQq1ZnkgWHXDNySYzx8AQfux+xm5NmSQtQ=",
         "owner": "awked-com",
         "repo": "packages",
-        "rev": "d83535ebaf12698e5ef86d030f7ea36b87dd42b3",
+        "rev": "ad6715bf182a5b71f47dc98332372b58446011eb",
         "type": "github"
       },
       "original": {
