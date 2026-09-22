@@ -1,8 +1,16 @@
 {
   description = "Reusable package fixes for Nixpkgs";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.awked-packages = {
+    url = "github:awked-com/packages";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      awked-packages,
+    }:
     let
       inherit (nixpkgs) lib;
       systems = [
@@ -55,6 +63,7 @@
             packages = [
               pkgs.nixfmt
               pkgs.quilt
+              awked-packages.packages.${system}.overlay
             ];
           };
         }

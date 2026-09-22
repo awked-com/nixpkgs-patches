@@ -89,10 +89,12 @@ unpatched copy of the locked upstream source, refresh without timestamps, and
 retain existing authorship and copyright notices. See [PROVENANCE.md](PROVENANCE.md)
 for source and licensing boundaries.
 
-The standalone `overlay` command can manage these stacks using this flake's
-locked sources. With it installed, run from this checkout:
+The standalone [overlay](https://github.com/awked-com/overlay) command manages
+these stacks using this flake's locked sources. `nix develop` provides its
+pinned package. From this checkout:
 
 ```sh
+nix develop
 overlay list
 overlay setup dnsmasq
 overlay status dnsmasq
