@@ -57,7 +57,7 @@ UxPlay's optional `UXPLAY_DISPLAY_COMMAND` names an executable called with
 with `-nh` when relying on the control-request bounds. Enabling HLS also requires
 queued nonblocking FCUP output, which these patches do not provide. Miraclecast
 exposes `MIRACLECAST_WPA_CONTROL`, `MIRACLECAST_WPA_CLIENT_DIR`, and
-`MIRACLECAST_SOCKET_MARK` for integrations; no host-specific values are supplied.
+`MIRACLECAST_SOCKET_MARK`.
 
 Miraclecast disables reliance on udev tags and adds GStreamer's base plugin.
 `nextcloud-oidc-login` wraps `nextcloud34.packages.apps.oidc_login` and removes
@@ -75,8 +75,7 @@ nix flake check
 
 Use the matching system name for the contract build. It checks exported package
 settings, patch order, and upstream override arguments. Full flake checks build
-supported packages on the current system. Network, display, mount, and
-authentication changes also need runtime integration tests.
+supported packages on the current system.
 
 Keep patches in filename order as `NNNN-description.patch`. Use Quilt against an
 unpatched copy of the locked upstream source and refresh without timestamps.
@@ -99,11 +98,4 @@ Use `overlay -C /path/to/nixpkgs-patches` from another directory. Source worktre
 live under `.patch-worktrees/pkgs` and are ignored by Git.
 
 `lib.patchFiles lib directory` returns a directory's numbered patch files in
-filename order and rejects invalid patch names. Consumers can reuse it for
-additional package overrides.
-
-Retain patch authorship, commit references, and copyright notices. AmneziaWG
-patches 0001–0004 retain their WireGuard authors; 0005 names Rany Hany; 0006 has
-no author header. Other patches are generally plain diffs without complete
-author or license declarations. This repository has no repository-wide license;
-upstream source and license metadata remain in the Nixpkgs recipes.
+filename order and rejects invalid patch names.
